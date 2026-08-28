@@ -1,27 +1,28 @@
 #include <Arduino.h>
 #include "Config.h"
+#include "BoardConfig.h"
+#include "GamepadState.h"
 #include "ButtonManager.h"
 #include "AxisManager.h"
 #include "LedController.h"
-#include "BleManager.h"
-#include "HidGamepad.h"
+#include "GamepadOutput.h"
 
 static ButtonManager buttonManager;
 static AxisManager axisManager;
 static LedController ledController;
-static BleManager bleManager;
+static GamepadOutput gamepadOutput;
 
 static uint32_t lastScanMs = 0;
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(115200); // útil para debug; inofensivo se você não abrir o monitor
 
-    ledController.begin();
-    buttonManager.begin();
-    axisManager.begin();
-    bleManager.begin();
+    const BoardConfig& board = getBoardConfig();
 
-    Serial.println("ButtonBox pronto. Aguardando conexao BLE...");
+    ledController.begin(board.leds);
+    buttonManager.begin(board.matrix);
+    axisManager.begin(board.axis, board.axisInvert, board.axisRead);
+    gamepadOutput.begin();
 }
 
 void loop() {
@@ -35,25 +36,17 @@ void loop() {
     axisManager.update();
 
     // --------------------------------------------------------------------
-    // Exemplo de LED de status TOTALMENTE independente do report HID:
-    // aceso enquanto houver uma conexão BLE ativa.
-    //
-    // Para os seus casos (porta aberta, alerta, etc.), a ideia é a mesma:
-    // leia o sinal/sensor relevante (pode até ser um botão da matriz que
-    // você decida tratar como sensor, não como botão de jogo) e chame
-    // ledController.set(...)/blink(...) com a condição que quiser aqui.
+    // Exemplo de LED de status TOTALMENTE independente do report HID.
+    // Para os seus casos reais (porta aberta, alerta, etc.), leia o
+    // sinal/sensor relevante e chame o setter nomeado correspondente
+    // (setDoorOpen, setAlert, ...) — nada disso passa pelo protocolo do
+    // gamepad.
     // --------------------------------------------------------------------
-    ledController.set(LED_BLE_STATUS, bleManager.isConnected());
+    ledController.setStatus(gamepadOutput.isConnected());
 
-    GamepadReport report;
-    report.buttons = buttonManager.getButtonBitmask();
+    GamepadState state;
+    state.buttons = buttonManager.getButtonBitmask();
+    state.axis    = axisManager.getValues();
 
-    uint8_t axisBytes[AXIS_COUNT];
-    axisManager.fillReportBytes(axisBytes);
-    report.axisX  = axisBytes[0];
-    report.axisY  = axisBytes[1];
-    report.axisZ  = axisBytes[2];
-    report.axisRz = axisBytes[3];
-
-    bleManager.sendReport(report);
+    gamepadOutput.update(state);
 }

@@ -1,22 +1,28 @@
 #pragma once
-#include <cstdint>
-#include "Config.h"
+#include <stdint.h>
+#include "BoardConfig.h"
 
 // Controla LEDs que NÃO fazem parte do report HID do gamepad — são
 // indicadores próprios seus (porta aberta, alerta, status de conexão, etc.).
-// Use como quiser a partir do main.cpp: ligar/desligar/piscar conforme
-// qualquer condição da sua aplicação (inclusive lendo botões que você
-// decida tratar como "sensores" em vez de botões de jogo).
+// Cada papel tem seu próprio setter nomeado (setDoorOpen, setAlert, ...) em
+// vez de um índice genérico — evita acender o LED errado por engano de índice.
 class LedController {
 public:
-    void begin();
-    void set(uint8_t index, bool on);
-    void toggle(uint8_t index);
+    void begin(const LedPins& pins);
 
-    // Chame a cada loop; o LED pisca sozinho no período informado.
-    void blink(uint8_t index, uint32_t periodMs);
+    void setDoorOpen(bool on);
+    void setAlert(bool on);
+    void setStatus(bool on);
+    void setSpare(bool on);
+
+    // Pisca o LED de alerta no período informado. Chame a cada loop.
+    void blinkAlert(uint32_t periodMs);
 
 private:
-    uint32_t _lastBlinkMs[LED_COUNT] = {0};
-    bool _blinkState[LED_COUNT] = {false};
+    LedPins _pins{};
+
+    uint32_t _alertBlinkLastMs = 0;
+    bool _alertBlinkState = false;
+
+    static void write(uint8_t pin, bool on);
 };

@@ -1,15 +1,20 @@
 #pragma once
-#include "Config.h"
+#include "BoardConfig.h"
+#include "GamepadState.h"
 #include "Axis.h"
 
+// Dono dos 4 eixos nomeados (X, Y, Z, Rz). Recebe a configuração da placa
+// como objetos tipados e devolve os valores lidos como um AxisValues —
+// nunca como array solto por índice.
 class AxisManager {
 public:
-    void begin();
+    void begin(const AxisPins& pins, const AxisInvertFlags& invert, const AxisReadSettings& settings);
     void update();
-
-    // Escreve AXIS_COUNT bytes (0-255 cada) prontos para o report HID.
-    void fillReportBytes(uint8_t* out) const;
+    AxisValues getValues() const;
 
 private:
-    Axis _axes[AXIS_COUNT];
+    Axis _x;
+    Axis _y;
+    Axis _z;
+    Axis _rz;
 };

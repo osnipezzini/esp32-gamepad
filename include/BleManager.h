@@ -1,6 +1,7 @@
 #pragma once
 #include <NimBLEDevice.h>
 #include "HidGamepad.h"
+#include <NimBLEHIDDevice.h>
 
 // Sobe o dispositivo BLE como um HID over GATT genérico (serviço 0x1812)
 // usando o report descriptor definido em HidGamepad.h. Não usa nenhum

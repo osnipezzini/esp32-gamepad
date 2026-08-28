@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "Config.h"
+#include "BoardConfig.h"
 #include "IButton.h"
 
 // Dono de todos os objetos IButton*, um por botão físico da matriz.
@@ -8,13 +9,14 @@
 // IButton com o estado já limpo, e montar o bitmask final para o report HID.
 class ButtonManager {
 public:
-    void begin();
+    void begin(const MatrixPins& pins);
     void update();
     uint16_t getButtonBitmask() const;
 
     ~ButtonManager();
 
 private:
+    MatrixPins _pins{};
     IButton* _buttons[BUTTON_COUNT] = {nullptr};
 
     bool _rawState[BUTTON_COUNT]        = {false};

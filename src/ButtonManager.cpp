@@ -14,13 +14,15 @@ IButton* ButtonManager::createButton(ButtonMode mode) {
     }
 }
 
-void ButtonManager::begin() {
+void ButtonManager::begin(const MatrixPins& pins) {
+    _pins = pins;
+
     for (uint8_t r = 0; r < MATRIX_ROWS; r++) {
-        pinMode(ROW_PINS[r], OUTPUT);
-        digitalWrite(ROW_PINS[r], HIGH); // linhas ficam em repouso HIGH
+        pinMode(_pins.rows[r], OUTPUT);
+        digitalWrite(_pins.rows[r], HIGH); // linhas ficam em repouso HIGH
     }
     for (uint8_t c = 0; c < MATRIX_COLS; c++) {
-        pinMode(COL_PINS[c], INPUT_PULLUP);
+        pinMode(_pins.cols[c], INPUT_PULLUP);
     }
     for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
         _buttons[i] = createButton(BUTTON_MODES[i]);
@@ -29,16 +31,16 @@ void ButtonManager::begin() {
 
 void ButtonManager::scanMatrix() {
     for (uint8_t r = 0; r < MATRIX_ROWS; r++) {
-        digitalWrite(ROW_PINS[r], LOW);   // ativa só esta linha
-        delayMicroseconds(20);            // tempo para a linha estabilizar
+        digitalWrite(_pins.rows[r], LOW);  // ativa só esta linha
+        delayMicroseconds(20);             // tempo para a linha estabilizar
 
         for (uint8_t c = 0; c < MATRIX_COLS; c++) {
             uint8_t index = r * MATRIX_COLS + c;
             // Pull-up interno: nível LOW na coluna = botão fechado (pressionado).
-            _rawState[index] = (digitalRead(COL_PINS[c]) == LOW);
+            _rawState[index] = (digitalRead(_pins.cols[c]) == LOW);
         }
 
-        digitalWrite(ROW_PINS[r], HIGH); // desativa a linha antes de ir para a próxima
+        digitalWrite(_pins.rows[r], HIGH); // desativa a linha antes de ir para a próxima
     }
 }
 

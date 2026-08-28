@@ -1,5 +1,5 @@
 #pragma once
-#include <cstdint>
+#include <stdint.h>
 
 // Interface comum a todos os comportamentos de botão.
 // O ButtonManager não sabe (nem precisa saber) qual implementação concreta

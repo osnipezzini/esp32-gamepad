@@ -1,5 +1,5 @@
 #pragma once
-#include <cstdint>
+#include <stdint.h>
 
 // Layout exato dos bytes enviados no report HID (sem o Report ID, que vai
 // como prefixo separado pela camada BLE HID). Total: 6 bytes.

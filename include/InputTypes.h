@@ -1,5 +1,5 @@
 #pragma once
-#include <cstdint>
+#include <stdint.h>
 
 // Cada botão físico pode se comportar de um jeito diferente no report HID,
 // independente do que fisicamente está acontecendo no pino.
