@@ -776,11 +776,9 @@ func buildLegend() fyne.CanvasObject {
 		nameLabel.TextStyle = fyne.TextStyle{Bold: true}
 		
 		descLabel := widget.NewLabel(t(mode.Key + "_desc"))
-		descLabel.TextSize = 9
 		descLabel.Wrapping = fyne.TextWrapWord
 		
 		idealLabel := widget.NewLabel("💡 " + t(mode.Key + "_ideal"))
-		idealLabel.TextSize = 8
 		idealLabel.TextStyle = fyne.TextStyle{Italic: true}
 		idealLabel.Wrapping = fyne.TextWrapWord
 		
@@ -836,11 +834,14 @@ func showModeHelpDialog() {
 	
 	helpText.WriteString("_" + t("config_restored") + "_")
 
+	// Use simple label instead of markdown widget (not available in Fyne 2.x)
+	content := widget.NewLabel(helpText.String())
+	
 	dialog.ShowCustomConfirm(
 		t("button_modes_title"),
 		t("close"),
 		t("ok"),
-		widget.NewMarkdown(helpText.String()),
+		content,
 		func(confirmed bool) {},
 		fyne.CurrentApp().Driver().AllWindows()[0],
 	)
