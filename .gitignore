@@ -3,3 +3,9 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+# Build outputs (gerados pelas pipelines e scripts locais)
+dist/
+tools/config-gui/buttonbox-config-gui
+tools/config-gui/buttonbox-config-gui.exe
+tools/config-gui/buttonbox-config-gui-*
+tools/config-gui/pkg/

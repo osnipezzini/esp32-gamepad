@@ -3,9 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"image/color"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,7 +17,8 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
-	"image/color"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	serial "go.bug.st/serial"
 )
@@ -91,20 +92,20 @@ type ButtonConfig struct {
 }
 
 type uiState struct {
-	config            []ButtonConfig
-	buttonStates      []bool // true = pressed, false = released
-	ports             []string
-	selectedPort      string
-	joysticks         []string
-	selectedJoystick  string
-	status            binding.String
-	exportText        binding.String
-	lastReadMs        int64
-	jsFile            *os.File
-	jsStopChan        chan bool
-	jsUpdateCallback  func([]bool)
-	jsMonitoring      bool
-	jsMutex           sync.Mutex
+	config           []ButtonConfig
+	buttonStates     []bool // true = pressed, false = released
+	ports            []string
+	selectedPort     string
+	joysticks        []string
+	selectedJoystick string
+	status           binding.String
+	exportText       binding.String
+	lastReadMs       int64
+	jsFile           *os.File
+	jsStopChan       chan bool
+	jsUpdateCallback func([]bool)
+	jsMonitoring     bool
+	jsMutex          sync.Mutex
 }
 
 func normalizeMode(raw string) string {
@@ -124,8 +125,59 @@ func buildDefaultConfig() []ButtonConfig {
 	return cfg
 }
 
+func appBaseDir() string {
+	// tenta diretório do executável primeiro (funciona quando exe está em tools/config-gui ou distribuído)
+	// fallback para diretório atual (funciona com `go run .`)
+	if exe, err := os.Executable(); err == nil {
+		if dir := filepath.Dir(exe); dir != "" && dir != "." {
+			// verifica se o dir contém locales ou é utilizável
+			if _, err := os.Stat(dir); err == nil {
+				return dir
+			}
+		}
+	}
+	return "."
+}
+
+func configFilePath() string {
+	// Para `go run` o executável é temporário em %TEMP%\go-build* — não usar esse dir
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		isTemp := strings.Contains(strings.ToLower(dir), "temp") || strings.Contains(dir, "go-build")
+		if !isTemp && dir != "" && dir != "." {
+			p := filepath.Join(dir, "buttonbox-config.json")
+			// se já existe ao lado do exe, usa; se não, usa exe dir apenas se for o diretório
+			// real do projeto (contém locales/go.mod), senão fallback para cwd
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+			if _, err := os.Stat(filepath.Join(dir, "locales")); err == nil {
+				return p
+			}
+			if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+				return p
+			}
+		}
+	}
+	return filepath.Join(".", "buttonbox-config.json")
+}
+
+func localesDir() string {
+	candidates := []string{
+		filepath.Join(".", "locales"),
+		filepath.Join(appBaseDir(), "locales"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	// fallback para o primeiro (erro será reportado)
+	return candidates[0]
+}
+
 func loadStoredConfig() []ButtonConfig {
-	path := filepath.Join(".", "buttonbox-config.json")
+	path := configFilePath()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return buildDefaultConfig()
@@ -153,7 +205,7 @@ func persistLocalConfig(cfg []ButtonConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(".", "buttonbox-config.json"), data, 0o644)
+	return os.WriteFile(configFilePath(), data, 0o644)
 }
 
 func exportCPP(cfg []ButtonConfig) string {
@@ -170,50 +222,56 @@ func exportCPP(cfg []ButtonConfig) string {
 }
 
 func listSerialPorts() []string {
-	candidates := map[string]struct{}{}
-	if runtime.GOOS == "windows" {
-		for drive := byte('A'); drive <= byte('Z'); drive++ {
-			path := fmt.Sprintf("%c:", drive)
-			if _, err := os.Stat(path); err != nil {
+	// go.bug.st/serial já implementa enumeração nativa cross-platform:
+	// Windows via SetupAPI, Linux via /dev, macOS via IOKit.
+	// É a única forma confiável — os.Stat("COMx") nunca funciona no Windows.
+	ports, err := serial.GetPortsList()
+	if err == nil {
+		// GetPortsList pode retornar lista vazia sem erro quando não há portas
+		dedup := make(map[string]struct{}, len(ports))
+		uniq := make([]string, 0, len(ports))
+		for _, p := range ports {
+			p = strings.TrimSpace(p)
+			if p == "" {
 				continue
 			}
-			for i := 1; i <= 256; i++ {
-				name := fmt.Sprintf("COM%d", i)
-				if _, err := os.Stat(name); err == nil {
-					candidates[name] = struct{}{}
-				}
+			if _, ok := dedup[p]; !ok {
+				dedup[p] = struct{}{}
+				uniq = append(uniq, p)
 			}
 		}
-	} else {
-		entries, err := os.ReadDir("/dev")
-		if err == nil {
-			for _, entry := range entries {
-				name := entry.Name()
-				if strings.Contains(name, "ttyUSB") || strings.Contains(name, "ttyACM") || strings.Contains(name, "cu.usb") || strings.Contains(name, "tty.usb") {
-					candidates[filepath.Join("/dev", name)] = struct{}{}
-				}
+		sort.Strings(uniq)
+		return uniq
+	}
+	// fallback apenas se a API falhar (ex: permissão) — mantém compatibilidade Linux antiga
+	candidates := map[string]struct{}{}
+	entries, err := os.ReadDir("/dev")
+	if err == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if strings.Contains(name, "ttyUSB") || strings.Contains(name, "ttyACM") || strings.Contains(name, "cu.usb") || strings.Contains(name, "tty.usb") {
+				candidates[filepath.Join("/dev", name)] = struct{}{}
 			}
 		}
 	}
-	ports := make([]string, 0, len(candidates))
+	fallback := make([]string, 0, len(candidates))
 	for port := range candidates {
-		ports = append(ports, port)
+		fallback = append(fallback, port)
 	}
-	sort.Strings(ports)
-	return ports
+	sort.Strings(fallback)
+	return fallback
 }
 
 func listJoysticks() []string {
+	// Linux: /dev/input/js* — no Windows/macOS o diretório não existe e retorna vazio (esperado)
 	joysticks := []string{}
-	if runtime.GOOS == "linux" {
-		entries, err := os.ReadDir("/dev/input")
-		if err == nil {
-			for _, entry := range entries {
-				name := entry.Name()
-				if strings.HasPrefix(name, "js") {
-					path := filepath.Join("/dev/input", name)
-					joysticks = append(joysticks, path)
-				}
+	entries, err := os.ReadDir("/dev/input")
+	if err == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if strings.HasPrefix(name, "js") {
+				path := filepath.Join("/dev/input", name)
+				joysticks = append(joysticks, path)
 			}
 		}
 	}
@@ -231,14 +289,14 @@ func readJoystickEvents(state *uiState, joystickPath string, winUpdateFunc func(
 		return
 	}
 	defer file.Close()
-	
+
 	state.jsMutex.Lock()
 	state.jsFile = file
 	state.jsMonitoring = true
 	state.jsMutex.Unlock()
-	
+
 	setStatus(state, t("monitoring")+" "+joystickPath)
-	
+
 	buf := make([]byte, 8)
 	for {
 		state.jsMutex.Lock()
@@ -247,7 +305,7 @@ func readJoystickEvents(state *uiState, joystickPath string, winUpdateFunc func(
 			return
 		}
 		state.jsMutex.Unlock()
-		
+
 		n, err := file.Read(buf)
 		if err != nil {
 			setStatus(state, t("error_reading_joystick")+": "+err.Error())
@@ -259,21 +317,21 @@ func readJoystickEvents(state *uiState, joystickPath string, winUpdateFunc func(
 		if n < 8 {
 			continue
 		}
-		
+
 		// Parse joystick event: time(4) + value(2) + type(1) + number(1)
 		jsType := buf[6]
 		jsNumber := buf[7]
-		
+
 		// jsType & 0x80 = initialization, we ignore it
 		// jsType & 0x01 = button event
 		// jsType & 0x02 = axis event
-		
+
 		if (jsType & 0x01) != 0 { // Button event
 			if jsNumber < totalButtons {
 				state.jsMutex.Lock()
 				state.buttonStates[jsNumber] = (buf[4] != 0)
 				state.jsMutex.Unlock()
-				
+
 				// Trigger UI update
 				if winUpdateFunc != nil {
 					winUpdateFunc()
@@ -413,15 +471,15 @@ func setExport(state *uiState) {
 
 func newUIState() *uiState {
 	state := &uiState{
-		config:        loadStoredConfig(),
-		buttonStates:  make([]bool, totalButtons),
-		ports:         listSerialPorts(),
-		joysticks:     listJoysticks(),
-		status:        binding.NewString(),
-		exportText:    binding.NewString(),
-		jsStopChan:    make(chan bool, 1),
-		jsMonitoring:  false,
-		jsMutex:       sync.Mutex{},
+		config:           loadStoredConfig(),
+		buttonStates:     make([]bool, totalButtons),
+		ports:            listSerialPorts(),
+		joysticks:        listJoysticks(),
+		status:           binding.NewString(),
+		exportText:       binding.NewString(),
+		jsStopChan:       make(chan bool, 1),
+		jsMonitoring:     false,
+		jsMutex:          sync.Mutex{},
 		jsUpdateCallback: nil,
 	}
 	_ = state.status.Set(t("ready"))
@@ -435,158 +493,286 @@ func newUIState() *uiState {
 	return state
 }
 
+// ---- Design Tokens: ButtonBox Cockpit ----
+var (
+	colBg         = color.NRGBA{R: 11, G: 14, B: 17, A: 255} // #0B0E11 cockpit
+	colPanel      = color.NRGBA{R: 20, G: 26, B: 31, A: 255} // #141A1F
+	colPanelEdge  = color.NRGBA{R: 35, G: 47, B: 55, A: 255} // #232F37
+	colSteel      = color.NRGBA{R: 138, G: 150, B: 163, A: 255}
+	colInk        = color.NRGBA{R: 232, G: 234, B: 227, A: 255}
+	colInkMuted   = color.NRGBA{R: 138, G: 150, B: 163, A: 255}
+	colCodeBg     = color.NRGBA{R: 14, G: 19, B: 23, A: 255}
+	colAccent     = color.NRGBA{R: 255, G: 138, B: 24, A: 255} // amber signature
+	colNormal     = color.NRGBA{R: 74, G: 155, B: 224, A: 255}
+	colOneShot    = color.NRGBA{R: 232, G: 164, B: 74, A: 255}
+	colToggle     = color.NRGBA{R: 125, G: 216, B: 125, A: 255}
+	colLongPress  = color.NRGBA{R: 232, G: 90, B: 122, A: 255}
+	colLedOff     = color.NRGBA{R: 45, G: 58, B: 68, A: 255}
+	colLedOn      = color.NRGBA{R: 255, G: 77, B: 77, A: 255}
+	colLedGlowOff = color.NRGBA{R: 45, G: 58, B: 68, A: 60}
+	colLedGlowOn  = color.NRGBA{R: 255, G: 77, B: 77, A: 90}
+)
+
 func getModeColor(mode string) color.Color {
 	switch normalizeMode(mode) {
 	case "NORMAL":
-		return color.NRGBA{R: 100, G: 150, B: 200, A: 255}
+		return colNormal
 	case "ONE_SHOT":
-		return color.NRGBA{R: 200, G: 150, B: 100, A: 255}
+		return colOneShot
 	case "TOGGLE":
-		return color.NRGBA{R: 150, G: 200, B: 100, A: 255}
+		return colToggle
 	case "LONG_PRESS":
-		return color.NRGBA{R: 200, G: 100, B: 150, A: 255}
+		return colLongPress
 	default:
-		return color.NRGBA{R: 100, G: 100, B: 100, A: 255}
+		return colSteel
+	}
+}
+
+func getModeLabel(mode string) string {
+	switch normalizeMode(mode) {
+	case "NORMAL":
+		return "NORMAL"
+	case "ONE_SHOT":
+		return "ONE-SHOT"
+	case "TOGGLE":
+		return "TOGGLE"
+	case "LONG_PRESS":
+		return "LONG-PRESS"
+	default:
+		return mode
 	}
 }
 
 func buildGrid(state *uiState) *fyne.Container {
 	cards := make([]fyne.CanvasObject, 0, totalButtons)
 	for i, item := range state.config {
-		index := i
-		isPressed := false
-		if i < len(state.buttonStates) {
-			isPressed = state.buttonStates[i]
-		}
+		idx := i
+		mode := normalizeMode(item.Mode)
+		isPressed := i < len(state.buttonStates) && state.buttonStates[i]
+		accent := getModeColor(mode)
 
-		// LED circle for button press state (smaller: 24x24)
-		ledColor := color.NRGBA{R: 100, G: 200, B: 100, A: 255}
+		// hairline top signature
+		accentBar := canvas.NewRectangle(accent)
+		accentBar.SetMinSize(fyne.NewSize(0, 3))
+
+		// number badge + LED ring
+		numText := canvas.NewText(fmt.Sprintf("%02d", item.Index), colInk)
+		numText.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
+		numText.TextSize = 18
+		numText.Alignment = fyne.TextAlignCenter
+
+		ledOuter := canvas.NewCircle(colLedGlowOff)
+		ledInner := canvas.NewCircle(colLedOff)
+		ledInner.StrokeColor = colPanelEdge
+		ledInner.StrokeWidth = 1.5
 		if isPressed {
-			ledColor = color.NRGBA{R: 255, G: 50, B: 50, A: 255}
+			ledOuter.FillColor = colLedGlowOn
+			ledInner.FillColor = colLedOn
+			ledInner.StrokeColor = color.NRGBA{R: 80, G: 20, B: 20, A: 255}
 		}
-		ledCircle := canvas.NewCircle(ledColor)
-		ledCircle.StrokeColor = color.NRGBA{R: 50, G: 50, B: 50, A: 255}
-		ledCircle.StrokeWidth = 1
+		ledStack := container.NewStack(ledOuter, container.NewCenter(ledInner), container.NewCenter(numText))
+		ledStack.Resize(fyne.NewSize(52, 52))
+		// wrapper to enforce size
+		ledWrap := container.NewWithoutLayout(ledStack)
+		ledWrap.Resize(fyne.NewSize(52, 52))
+		ledWrap.Layout = layout.NewCenterLayout()
+		// simpler: put in a fixed container
+		ledBox := container.NewCenter(ledStack)
+		ledBox.Resize(fyne.NewSize(56, 56))
 
-		// Button number (small)
-		numLabel := widget.NewLabel(fmt.Sprintf("%d", item.Index))
-		numLabel.Alignment = fyne.TextAlignCenter
-		numLabelContainer := container.NewCenter(numLabel)
+		modeLabel := canvas.NewText(getModeLabel(mode), colSteel)
+		modeLabel.TextSize = 9
+		modeLabel.TextStyle = fyne.TextStyle{Bold: true}
+		modeLabel.Alignment = fyne.TextAlignCenter
 
-		// LED with number overlaid
-		ledContainer := container.NewStack(
-			ledCircle,
-			numLabelContainer,
-		)
-		ledContainer.Resize(fyne.NewSize(24, 24))
-
-		// Mode selector with tooltip
-		modeSelector := widget.NewSelect([]string{"NORMAL", "ONE_SHOT", "TOGGLE", "LONG_PRESS"}, func(mode string) {
-			state.config[index].Mode = normalizeMode(mode)
-			if err := persistLocalConfig(state.config); err != nil {
-				setStatus(state, t("config_save_failed")+err.Error())
-				return
-			}
+		// Select — keep native but with placeholder fix
+		sel := widget.NewSelect([]string{"NORMAL", "ONE_SHOT", "TOGGLE", "LONG_PRESS"}, func(m string) {
+			state.config[idx].Mode = normalizeMode(m)
+			_ = persistLocalConfig(state.config)
 			setExport(state)
 			setStatus(state, t("config_saved"))
 		})
-		modeSelector.SetSelected(item.Mode)
-		modeSelector.PlaceHolder = "Select mode"
+		sel.SetSelected(mode)
+		sel.PlaceHolder = "Modo"
 
-		// Mode color indicator bar (smaller)
-		modeIndicator := canvas.NewRectangle(getModeColor(item.Mode))
+		// status dot under select
+		dot := canvas.NewCircle(accent)
+		dot.Resize(fyne.NewSize(8, 8))
+		dotBox := container.NewCenter(dot)
 
-		// Card layout: LED + mode selector + color bar
-		card := container.NewVBox(
-			container.NewCenter(ledContainer),
-			modeSelector,
-			modeIndicator,
+		// card background + border
+		bg := canvas.NewRectangle(colPanel)
+		bg.StrokeColor = colPanelEdge
+		bg.StrokeWidth = 1
+		bg.CornerRadius = 10
+
+		inner := container.NewVBox(
+			accentBar,
+			layout.NewSpacer(),
+			ledBox,
+			modeLabel,
+			sel,
+			dotBox,
+			layout.NewSpacer(),
 		)
-		
-		// Wrap in box with padding
-		cards = append(cards, container.NewPadded(card))
+		innerPad := container.NewPadded(inner)
+
+		cardStack := container.NewStack(bg, innerPad)
+		cardStack.Resize(fyne.NewSize(0, 0))
+		// enforce card size via wrapper
+		wrapper := container.NewPadded(cardStack)
+		// fyne Grid will stretch, but we give min size via outer container
+		cardWithSize := container.NewStack(wrapper)
+		cardWithSize.Resize(fyne.NewSize(160, 148))
+		// Use layout to enforce min
+		cards = append(cards, container.NewPadded(cardWithSize))
 	}
-	return container.NewGridWithColumns(8, cards...)
+	grid := container.NewGridWithColumns(4, cards...)
+	// give grid a stable height — 4 rows of ~155 = 620
+	scrollContent := container.NewPadded(grid)
+	// wrap in a container with min size to avoid collapse seen in screenshot
+	holder := container.NewWithoutLayout(scrollContent)
+	// no scroll needed for 4x4 on 1000px, but keep scroll for small screens
+	return container.NewStack(holder)
 }
 
-func buildLegend() *fyne.Container {
-	ledLegend := container.NewVBox(
-		widget.NewLabel(t("led_state")),
-		container.NewHBox(
-			container.NewStack(
-				canvas.NewCircle(color.NRGBA{R: 100, G: 200, B: 100, A: 255}),
-			),
-			widget.NewLabel(t("not_pressed")),
-		),
-		container.NewHBox(
-			container.NewStack(
-				canvas.NewCircle(color.NRGBA{R: 255, G: 50, B: 50, A: 255}),
-			),
-			widget.NewLabel(t("pressed")),
-		),
+func buildLegend() fyne.CanvasObject {
+	// LED state row
+	ledOffOuter := canvas.NewCircle(colLedGlowOff)
+	ledOffInner := canvas.NewCircle(colLedOff)
+	ledOff := container.NewStack(ledOffOuter, container.NewCenter(ledOffInner))
+	ledOff.Resize(fyne.NewSize(14, 14))
+	ledOnOuter := canvas.NewCircle(colLedGlowOn)
+	ledOnInner := canvas.NewCircle(colLedOn)
+	ledOn := container.NewStack(ledOnOuter, container.NewCenter(ledOnInner))
+	ledOn.Resize(fyne.NewSize(14, 14))
+
+	ledTitle := canvas.NewText(strings.ToUpper(t("led_state")), colSteel)
+	ledTitle.TextSize = 10
+	ledTitle.TextStyle = fyne.TextStyle{Bold: true}
+	ledRow := container.NewVBox(
+		ledTitle,
+		container.NewHBox(ledOff, widget.NewLabel(t("not_pressed"))),
+		container.NewHBox(ledOn, widget.NewLabel(t("pressed"))),
 	)
 
-	modeColorItems := []struct {
-		mode  string
-		descKey string
-	}{
-		{"NORMAL", "mode_normal"},
-		{"ONE_SHOT", "mode_one_shot"},
-		{"TOGGLE", "mode_toggle"},
-		{"LONG_PRESS", "mode_long_press"},
-	}
+	modesTitle := canvas.NewText(strings.ToUpper(t("modes")), colSteel)
+	modesTitle.TextSize = 10
+	modesTitle.TextStyle = fyne.TextStyle{Bold: true}
 
-	legendCards := make([]fyne.CanvasObject, 0, len(modeColorItems))
-	for _, item := range modeColorItems {
-		colorRect := canvas.NewRectangle(getModeColor(item.mode))
-		colorRect.SetMinSize(fyne.NewSize(12, 12))
-		label := widget.NewLabel(t(item.descKey))
-		card := container.NewHBox(colorRect, label)
-		legendCards = append(legendCards, card)
+	type leg struct {
+		key   string
+		color color.Color
 	}
+	items := []leg{
+		{"mode_normal", colNormal},
+		{"mode_one_shot", colOneShot},
+		{"mode_toggle", colToggle},
+		{"mode_long_press", colLongPress},
+	}
+	cols := make([]fyne.CanvasObject, 0, len(items))
+	for _, it := range items {
+		sw := canvas.NewRectangle(it.color)
+		sw.SetMinSize(fyne.NewSize(14, 14))
+		sw.CornerRadius = 3
+		lbl := widget.NewLabel(t(it.key))
+		lbl.Wrapping = fyne.TextWrapWord
+		cols = append(cols, container.NewHBox(sw, lbl))
+	}
+	legendGrid := container.NewGridWithColumns(2, cols...)
 
-	return container.NewVBox(
-		widget.NewRichTextFromMarkdown("### "+t("legend")),
-		ledLegend,
-		widget.NewRichTextFromMarkdown("**"+t("modes")+"**"),
-		container.NewGridWithColumns(2, legendCards...),
+	title := canvas.NewText("BUTTONBOX", colInkMuted)
+	title.TextSize = 9
+	title.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
+	title.Alignment = fyne.TextAlignLeading
+
+	legendCardBg := canvas.NewRectangle(colPanel)
+	legendCardBg.StrokeColor = colPanelEdge
+	legendCardBg.StrokeWidth = 1
+	legendCardBg.CornerRadius = 12
+
+	inner := container.NewVBox(
+		title,
+		canvas.NewRectangle(color.NRGBA{R: 35, G: 47, B: 55, A: 255}),
+		widget.NewLabelWithStyle("LEGENDA", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		ledRow,
+		layout.NewSpacer(),
+		modesTitle,
+		legendGrid,
 	)
+	// separator line
+	sep := canvas.NewRectangle(colPanelEdge)
+	sep.SetMinSize(fyne.NewSize(0, 1))
+	inner2 := container.NewVBox(inner)
+	pad := container.NewPadded(inner2)
+	return container.NewStack(legendCardBg, pad)
 }
 
-func buildUI(state *uiState, win fyne.Window) fyne.CanvasObject {
+func buildHeader(state *uiState, win fyne.Window) fyne.CanvasObject {
+	bg := canvas.NewRectangle(color.NRGBA{R: 8, G: 11, B: 14, A: 255})
+	bg.CornerRadius = 0
+
+	dot := canvas.NewCircle(colAccent)
+	dot.Resize(fyne.NewSize(8, 8))
+	title := canvas.NewText("ButtonBox — Button Mode Configuration", colInk)
+	title.TextSize = 13
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	sub := canvas.NewText("16× MATRIX  •  ESP32 / LEONARDO / PRO MICRO", colSteel)
+	sub.TextSize = 9
+	sub.TextStyle = fyne.TextStyle{Monospace: true}
+	titleBox := container.NewVBox(title, sub)
+	left := container.NewHBox(dot, titleBox)
+
+	// lang select — no recursion
+	langSel := widget.NewSelect([]string{"English", "Português (BR)"}, nil)
+	if currentLang == LangEnglish {
+		langSel.SetSelected("English")
+	} else {
+		langSel.SetSelected("Português (BR)")
+	}
+	langSel.OnChanged = func(v string) {
+		if v == "English" {
+			currentLang = LangEnglish
+		} else {
+			currentLang = LangPtBr
+		}
+		win.SetContent(buildUI(state, win))
+	}
+	langLabel := canvas.NewText("LANG", colSteel)
+	langLabel.TextSize = 9
+	langLabel.TextStyle = fyne.TextStyle{Bold: true}
+	right := container.NewHBox(langLabel, langSel)
+
+	headerInner := container.NewHBox(left, layout.NewSpacer(), right)
+	pad := container.NewPadded(headerInner)
+	return container.NewStack(bg, pad)
+}
+
+func buildDeck(state *uiState, win fyne.Window) fyne.CanvasObject {
 	ports := state.ports
 	if len(ports) == 0 {
 		ports = []string{t("no_ports_detected")}
 	}
-	portSelect := widget.NewSelect(ports, func(selected string) {
-		state.selectedPort = selected
-	})
+	portSel := widget.NewSelect(ports, func(v string) { state.selectedPort = v })
 	if state.selectedPort != "" {
-		portSelect.SetSelected(state.selectedPort)
+		portSel.SetSelected(state.selectedPort)
 	} else if len(ports) > 0 {
-		portSelect.SetSelected(ports[0])
+		portSel.SetSelected(ports[0])
 	}
 
 	joysticks := state.joysticks
 	if len(joysticks) == 0 {
 		joysticks = []string{t("no_joysticks_detected")}
 	}
-	joystickSelect := widget.NewSelect(joysticks, func(selected string) {
-		state.selectedJoystick = selected
-	})
+	joySel := widget.NewSelect(joysticks, func(v string) { state.selectedJoystick = v })
 	if state.selectedJoystick != "" {
-		joystickSelect.SetSelected(state.selectedJoystick)
+		joySel.SetSelected(state.selectedJoystick)
 	} else if len(joysticks) > 0 {
-		joystickSelect.SetSelected(joysticks[0])
+		joySel.SetSelected(joysticks[0])
 	}
 
-	statusLabel := widget.NewLabelWithData(state.status)
-	
-	exportEntry := widget.NewEntryWithData(state.exportText)
-	exportEntry.MultiLine = true
-	exportEntry.Disable()
-
-	readBtn := widget.NewButton(t("read_from_board"), func() {
+	// styled buttons
+	readBtn := widget.NewButtonWithIcon(t("read_from_board"), theme.DownloadIcon(), func() {
 		if state.selectedPort == "" || state.selectedPort == t("no_ports_detected") {
 			setStatus(state, t("select_serial_port"))
 			return
@@ -597,16 +783,12 @@ func buildUI(state *uiState, win fyne.Window) fyne.CanvasObject {
 			return
 		}
 		state.config = cfg
-		if err := persistLocalConfig(state.config); err != nil {
-			setStatus(state, t("read_ok_save_fail")+" "+err.Error())
-			return
-		}
+		_ = persistLocalConfig(state.config)
 		setExport(state)
 		setStatus(state, t("config_read_board"))
 		win.SetContent(buildUI(state, win))
 	})
-
-	applyBtn := widget.NewButton(t("apply_to_board"), func() {
+	applyBtn := widget.NewButtonWithIcon(t("apply_to_board"), theme.UploadIcon(), func() {
 		if state.selectedPort == "" || state.selectedPort == t("no_ports_detected") {
 			setStatus(state, t("select_serial_port"))
 			return
@@ -615,111 +797,131 @@ func buildUI(state *uiState, win fyne.Window) fyne.CanvasObject {
 			setStatus(state, t("error_applying_board")+" "+err.Error())
 			return
 		}
-		if err := persistLocalConfig(state.config); err != nil {
-			setStatus(state, t("applied_save_fail")+" "+err.Error())
-			return
-		}
+		_ = persistLocalConfig(state.config)
 		setStatus(state, t("config_applied")+" "+state.selectedPort+".")
 		setExport(state)
 	})
-
-	resetBtn := widget.NewButton(t("reset"), func() {
+	applyBtn.Importance = widget.HighImportance
+	resetBtn := widget.NewButtonWithIcon(t("reset"), theme.ViewRefreshIcon(), func() {
 		state.config = buildDefaultConfig()
-		if err := persistLocalConfig(state.config); err != nil {
-			setStatus(state, t("error_resetting")+" "+err.Error())
-			return
-		}
+		_ = persistLocalConfig(state.config)
 		setExport(state)
 		setStatus(state, t("config_restored"))
 		win.SetContent(buildUI(state, win))
 	})
 
-	var monitorBtn *widget.Button
-	monitorBtn = widget.NewButton(t("monitor_joystick"), func() {
+	var monBtn *widget.Button
+	monBtn = widget.NewButtonWithIcon(t("monitor_joystick"), theme.MediaPlayIcon(), func() {
 		state.jsMutex.Lock()
-		isMonitoring := state.jsMonitoring
+		isMon := state.jsMonitoring
 		state.jsMutex.Unlock()
-		
-		if isMonitoring {
+		if isMon {
 			state.jsMutex.Lock()
 			state.jsMonitoring = false
 			state.jsMutex.Unlock()
-			
 			if state.jsFile != nil {
 				state.jsFile.Close()
 				state.jsFile = nil
 			}
 			setStatus(state, t("monitoring_stopped"))
-			monitorBtn.SetText(t("monitor_joystick"))
+			monBtn.SetText(t("monitor_joystick"))
+			monBtn.SetIcon(theme.MediaPlayIcon())
 			return
 		}
-		
 		if state.selectedJoystick == "" || state.selectedJoystick == t("no_joysticks_detected") {
 			setStatus(state, t("select_joystick"))
 			return
 		}
-		
-		go readJoystickEvents(state, state.selectedJoystick, func() {
-			win.SetContent(buildUI(state, win))
-		})
-		monitorBtn.SetText(t("stop_monitoring"))
+		go readJoystickEvents(state, state.selectedJoystick, func() { win.SetContent(buildUI(state, win)) })
+		monBtn.SetText(t("stop_monitoring"))
+		monBtn.SetIcon(theme.MediaStopIcon())
 	})
 
-	// Language selector
-	langSelect := widget.NewSelect([]string{"English", "Português (BR)"}, func(lang string) {
-		if lang == "English" {
-			currentLang = LangEnglish
-		} else {
-			currentLang = LangPtBr
+	// deck cards
+	bg1 := canvas.NewRectangle(colPanel)
+	bg1.StrokeColor = colPanelEdge
+	bg1.StrokeWidth = 1
+	bg1.CornerRadius = 10
+	serialTitle := canvas.NewText("PORTA SERIAL", colSteel)
+	serialTitle.TextSize = 9
+	serialTitle.TextStyle = fyne.TextStyle{Bold: true}
+	deck1Inner := container.NewVBox(
+		serialTitle,
+		portSel,
+		container.NewHBox(readBtn, applyBtn, resetBtn),
+	)
+	deck1 := container.NewStack(bg1, container.NewPadded(deck1Inner))
+
+	bg2 := canvas.NewRectangle(colPanel)
+	bg2.StrokeColor = colPanelEdge
+	bg2.StrokeWidth = 1
+	bg2.CornerRadius = 10
+	joyTitle := canvas.NewText("JOYSTICK", colSteel)
+	joyTitle.TextSize = 9
+	joyTitle.TextStyle = fyne.TextStyle{Bold: true}
+	deck2Inner := container.NewVBox(
+		joyTitle,
+		joySel,
+		monBtn,
+	)
+	deck2 := container.NewStack(bg2, container.NewPadded(deck2Inner))
+
+	return container.NewGridWithColumns(2, deck1, deck2)
+}
+
+func buildUI(state *uiState, win fyne.Window) fyne.CanvasObject {
+	statusLabel := widget.NewLabelWithData(state.status)
+	statusLabel.Wrapping = fyne.TextWrapWord
+	statusLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+	exportEntry := widget.NewEntryWithData(state.exportText)
+	exportEntry.MultiLine = true
+	exportEntry.Wrapping = fyne.TextWrapOff
+	exportEntry.Disable()
+	// mono code bg
+	codeBg := canvas.NewRectangle(colCodeBg)
+	codeBg.StrokeColor = colPanelEdge
+	codeBg.StrokeWidth = 1
+	codeBg.CornerRadius = 8
+	codeStack := container.NewStack(codeBg, container.NewPadded(exportEntry))
+	codeStack.Resize(fyne.NewSize(0, 110))
+
+	exportTitle := canvas.NewText("C++ EXPORT", colSteel)
+	exportTitle.TextSize = 10
+	exportTitle.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
+	copyBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func() {
+		if txt, err := state.exportText.Get(); err == nil {
+			win.Clipboard().SetContent(txt)
+			setStatus(state, "Copiado")
 		}
-		win.SetContent(buildUI(state, win))
 	})
-	if currentLang == LangEnglish {
-		langSelect.SetSelected("English")
-	} else {
-		langSelect.SetSelected("Português (BR)")
-	}
+	copyBtn.Importance = widget.LowImportance
+	exportHeader := container.NewHBox(exportTitle, layout.NewSpacer(), copyBtn)
+	exportCardBg := canvas.NewRectangle(colPanel)
+	exportCardBg.StrokeColor = colPanelEdge
+	exportCardBg.StrokeWidth = 1
+	exportCardBg.CornerRadius = 10
+	exportCard := container.NewStack(exportCardBg, container.NewPadded(container.NewVBox(exportHeader, codeStack, statusLabel)))
 
-	topBar := container.NewHBox(
-		widget.NewLabel(t("serial_port")+" "),
-		portSelect,
-		readBtn,
-		applyBtn,
-		resetBtn,
-		widget.NewLabel("  |  Lang: "),
-		langSelect,
-	)
+	grid := buildGrid(state)
+	legend := buildLegend()
+	deck := buildDeck(state, win)
+	header := buildHeader(state, win)
 
-	joystickBar := container.NewHBox(
-		widget.NewLabel(t("joystick")+" "),
-		joystickSelect,
-		monitorBtn,
-	)
+	// main layout: header / deck / grid+legend / export
+	center := container.NewVBox(deck, container.NewHBox(container.NewPadded(grid), container.NewPadded(legend)))
 
-	// Organize content in sections
-	gridScroll := container.NewScroll(buildGrid(state))
-	
-	exportSection := container.NewVBox(
-		widget.NewRichTextFromMarkdown("**C++ Export:**"),
-		exportEntry,
-	)
-
-	return container.NewBorder(
-		topBar,           // top
-		buildLegend(),    // bottom
-		nil,              // left
-		nil,              // right
-		container.NewVBox(
-			joystickBar,
-			gridScroll,
-			exportSection,
-			statusLabel,
-		),
-	)
+	// outer bg
+	outerBg := canvas.NewRectangle(colBg)
+	content := container.NewVBox(header, center, exportCard)
+	padded := container.NewPadded(content)
+	scroll := container.NewVScroll(container.NewStack(outerBg, padded))
+	scroll.Direction = container.ScrollBoth
+	return container.NewStack(outerBg, scroll)
 }
 
 func main() {
-	if err := loadTranslations(filepath.Join(".", "locales")); err != nil {
+	if err := loadTranslations(localesDir()); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load translations: %v\n", err)
 		os.Exit(1)
 	}
@@ -727,11 +929,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "missing English locale")
 		os.Exit(1)
 	}
-	
+
 	a := app.New()
+	// dark cockpit theme
+	a.Settings().SetTheme(theme.DarkTheme())
 	state := newUIState()
-	w := a.NewWindow(t("title"))
-	w.Resize(fyne.NewSize(1000, 800))
+	w := a.NewWindow("ButtonBox — Button Mode Configuration")
+	w.Resize(fyne.NewSize(1180, 860))
 	w.SetContent(buildUI(state, w))
 	w.ShowAndRun()
 }

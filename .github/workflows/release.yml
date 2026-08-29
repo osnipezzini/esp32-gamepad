@@ -1,0 +1,391 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (ex: v1.2.3) — tag que será criada/atualizada"
+        required: true
+        default: "v0.1.0"
+      draft:
+        description: "Criar como rascunho?"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      prerelease:
+        description: "Marcar como pre-release?"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.22"
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # 1. Firmwares — builds PlatformIO (3 envs) no Linux
+  # ──────────────────────────────────────────────────────────
+  build-firmware:
+    name: Firmware — all boards
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          VER="${{ inputs.version }}"
+          [[ "$VER" == v* ]] || VER="v$VER"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VER" >> "$GITHUB_ENV"
+          echo "Resolved version: $VER (on-demand)"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            .pio/libdeps
+          key: pio-release-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-release-${{ runner.os }}-
+
+      - name: Build firmwares
+        run: pio run
+
+      - name: Package firmwares
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ steps.version.outputs.version }}"
+          # remove o 'v' para nome de arquivo opcional, mas mantém tag completa no release
+          OUT="dist/firmware"
+          mkdir -p "$OUT"
+
+          # ESP32 — firmware.bin + bootloader + partitions + elf
+          if [[ -f .pio/build/esp32dev/firmware.bin ]]; then
+            cp .pio/build/esp32dev/firmware.bin        "$OUT/firmware-esp32dev-${VER}.bin"
+            cp .pio/build/esp32dev/firmware.elf        "$OUT/firmware-esp32dev-${VER}.elf" 2>/dev/null || true
+            cp .pio/build/esp32dev/bootloader.bin      "$OUT/bootloader-esp32dev-${VER}.bin" 2>/dev/null || true
+            cp .pio/build/esp32dev/partitions.bin      "$OUT/partitions-esp32dev-${VER}.bin" 2>/dev/null || true
+            # merged image se esptool disponível
+            if command -v esptool.py &>/dev/null || python -m esptool --help &>/dev/null; then
+              echo "esptool available — merged image could be generated here"
+            fi
+          fi
+
+          # Leonardo
+          if [[ -f .pio/build/leonardo/firmware.hex ]]; then
+            cp .pio/build/leonardo/firmware.hex "$OUT/firmware-leonardo-${VER}.hex"
+            cp .pio/build/leonardo/firmware.elf "$OUT/firmware-leonardo-${VER}.elf" 2>/dev/null || true
+          fi
+
+          # Pro Micro 16MHz
+          if [[ -f .pio/build/promicro16/firmware.hex ]]; then
+            cp .pio/build/promicro16/firmware.hex "$OUT/firmware-promicro16-${VER}.hex"
+            cp .pio/build/promicro16/firmware.elf "$OUT/firmware-promicro16-${VER}.elf" 2>/dev/null || true
+          fi
+
+          # checksums
+          (cd "$OUT" && sha256sum * > SHA256SUMS.txt)
+          cat "$OUT/SHA256SUMS.txt"
+          ls -lh "$OUT/"
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ steps.version.outputs.version }}
+          path: dist/firmware/*
+          if-no-files-found: error
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────
+  # 2. GUI — build nativo por runner (Fyne precisa CGO+GPU libs)
+  # ──────────────────────────────────────────────────────────
+  build-gui:
+    name: GUI ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - runner: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+            archive: zip
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+    defaults:
+      run:
+        working-directory: tools/config-gui
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          VER="${{ inputs.version }}"
+          [[ "$VER" == v* ]] || VER="v$VER"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VER" >> "$GITHUB_ENV"
+          echo "Resolved version: $VER (on-demand)"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: tools/config-gui/go.sum
+
+      # ── Linux deps ──────────────────────────────
+      - name: Install Fyne deps (Linux)
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev \
+            libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev \
+            libasound2-dev libxxf86vm-dev
+
+      # ── Windows deps (GCC via msys2) ───────────
+      - name: Setup MSYS2 + GCC (Windows)
+        if: matrix.goos == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config
+
+      - name: Build GUI
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ steps.version.outputs.version }}"
+          OUT_NAME="buttonbox-config-gui-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          echo "Building $OUT_NAME @ $VER"
+
+          # Injeta versão via ldflags (main.version se existir, senão ignora)
+          LDFLAGS="-s -w -X main.version=${VER} -X main.buildVersion=${VER}"
+
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            # No Windows runner o msys2 já coloca gcc no PATH via msys2/setup-msys2
+            export PATH="C:/msys64/mingw64/bin:$PATH"
+            export CGO_ENABLED=1
+            export CC=x86_64-w64-mingw32-gcc
+            # fallback se CC não existir
+            command -v "$CC" || { export CC=gcc; }
+          else
+            export CGO_ENABLED=1
+          fi
+
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags="$LDFLAGS" -o "$OUT_NAME" ./...
+
+          ls -lh "$OUT_NAME"
+          file "$OUT_NAME" || true
+
+      - name: Package GUI (with locales + example config)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ steps.version.outputs.version }}"
+          BIN="buttonbox-config-gui-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          PKG_DIR="pkg/buttonbox-config-gui-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "$PKG_DIR"
+
+          cp "$BIN" "$PKG_DIR/"
+
+          # Empacota locales e config de exemplo junto ao binário
+          # (a GUI carrega locales/ relativo ao executável ou cwd)
+          if [[ -d locales ]]; then
+            cp -r locales "$PKG_DIR/"
+          fi
+          if [[ -f buttonbox-config.json ]]; then
+            cp buttonbox-config.json "$PKG_DIR/buttonbox-config.example.json"
+          fi
+          # README curto dentro do pacote
+          cat > "$PKG_DIR/README.txt" <<EOF
+          ButtonBox Config GUI ${VER}
+          OS: ${{ matrix.goos }} / ${{ matrix.goarch }}
+          Uso: execute o binário ao lado da pasta locales/
+          EOF
+
+          # checksum do binário solto
+          (cd "$PKG_DIR" && sha256sum "$BIN" > SHA256SUMS.txt 2>/dev/null || shasum -a 256 "$BIN" > SHA256SUMS.txt)
+
+          # cria arquivo final
+          STAGE="../../dist/gui"
+          mkdir -p "$STAGE"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            ARCHIVE="$STAGE/buttonbox-config-gui-${{ matrix.goos }}-${{ matrix.goarch }}-${VER}.zip"
+            if command -v zip &>/dev/null; then
+              (cd pkg && zip -r "$ARCHIVE" "buttonbox-config-gui-${{ matrix.goos }}-${{ matrix.goarch }}")
+            else
+              7z a "$ARCHIVE" "./pkg/buttonbox-config-gui-${{ matrix.goos }}-${{ matrix.goarch }}" 2>/dev/null || powershell Compress-Archive -Path "pkg/buttonbox-config-gui-${{ matrix.goos }}-${{ matrix.goarch }}" -DestinationPath "$ARCHIVE"
+            fi
+          else
+            ARCHIVE="$STAGE/buttonbox-config-gui-${{ matrix.goos }}-${{ matrix.goarch }}-${VER}.tar.gz"
+            tar -czf "$ARCHIVE" -C pkg "buttonbox-config-gui-${{ matrix.goos }}-${{ matrix.goarch }}"
+          fi
+
+          # também publica o binário solto (útil para 'go install' users que só querem o exe)
+          cp "$PKG_DIR/$BIN" "$STAGE/$BIN" 2>/dev/null || cp "$BIN" "$STAGE/"
+
+          ls -lh "$STAGE/"
+          cat "$PKG_DIR/SHA256SUMS.txt" || true
+
+      - name: Upload GUI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-${{ matrix.goos }}-${{ matrix.goarch }}-${{ steps.version.outputs.version }}
+          path: dist/gui/*
+          if-no-files-found: error
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────
+  # 3. Publica GitHub Release (agrupa firmwares + GUIs)
+  # ──────────────────────────────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    needs: [build-firmware, build-gui]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          VER="${{ inputs.version }}"
+          [[ "$VER" == v* ]] || VER="v$VER"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VER" >> "$GITHUB_ENV"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List + global checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "### Artifacts" 
+          find dist -type f | sort
+          echo ""
+          ls -lh dist/* 2>/dev/null || ls -R dist | head -100
+          # checksum global único
+          (cd dist && sha256sum **/* 2>/dev/null || sha256sum $(find . -type f) > SHA256SUMS.all.txt)
+          cat dist/SHA256SUMS.all.txt 2>/dev/null || true
+          echo ""
+          echo "Version: ${{ steps.version.outputs.version }}"
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          PREV="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")"
+          cat > RELEASE_NOTES.md <<EOF
+          # ButtonBox ${VER}
+
+          ## Firmwares
+          | Placa | Arquivo | Transporte |
+          |-------|---------|------------|
+          | ESP32-WROOM-32 | \`firmware-esp32dev-${VER}.bin\` | BLE HID |
+          | Arduino Leonardo | \`firmware-leonardo-${VER}.hex\` | USB HID |
+          | SparkFun Pro Micro 16MHz | \`firmware-promicro16-${VER}.hex\` | USB HID |
+
+          Flash:
+          \`\`\`bash
+          # ESP32
+          esptool.py --chip esp32 --port /dev/ttyUSB0 write_flash 0x1000 firmware-esp32dev-${VER}.bin
+          # ou: pio run -e esp32dev -t upload
+
+          # Leonardo / Pro Micro (via avrdude / PlatformIO)
+          pio run -e leonardo -t upload
+          pio run -e promicro16 -t upload
+          \`\`\`
+
+          ## GUI — ButtonBox Config Tool
+          | OS | Arquivo |
+          |----|---------|
+          | Linux (amd64) | \`buttonbox-config-gui-linux-amd64-${VER}.tar.gz\` |
+          | Windows (amd64) | \`buttonbox-config-gui-windows-amd64-${VER}.zip\` |
+          | macOS (arm64) | \`buttonbox-config-gui-darwin-arm64-${VER}.tar.gz\` |
+
+          > Cada pacote já contém \`locales/\` e \`buttonbox-config.example.json\` ao lado do executável.
+
+          ## Checksums
+          Verifique com \`sha256sum -c SHA256SUMS.all.txt\`.
+
+          ## Changelog
+          EOF
+          if [[ -n "$PREV" ]]; then
+            echo "" >> RELEASE_NOTES.md
+            echo "Diferenças desde $PREV:" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+            git log --pretty=format:"- %s (%h)" "$PREV"..HEAD >> RELEASE_NOTES.md || echo "- (sem histórico)" >> RELEASE_NOTES.md
+          else
+            echo "" >> RELEASE_NOTES.md
+            git log --pretty=format:"- %s (%h)" -20 >> RELEASE_NOTES.md || true
+          fi
+          cat RELEASE_NOTES.md
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ButtonBox ${{ steps.version.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true
+          append_body: true
+          draft: ${{ inputs.draft == 'true' }}
+          prerelease: ${{ inputs.prerelease == 'true' }}
+          files: |
+            dist/**/*
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
