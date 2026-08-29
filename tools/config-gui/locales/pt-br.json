@@ -19,6 +19,14 @@
   "mode_one_shot": "One-Shot: Ativa uma vez, depois reseta",
   "mode_toggle": "Toggle: Liga/desliga a cada pressão",
   "mode_long_press": "Long Press: Emula botão mantido",
+  "mode_normal_desc": "Ativo apenas enquanto pressionado",
+  "mode_one_shot_desc": "Dispara uma vez e reseta automaticamente",
+  "mode_toggle_desc": "Alterna entre ligado/desligado",
+  "mode_long_press_desc": "Simula pressão de ~2 segundos",
+  "mode_normal_ideal": "Aceleração, freio, funções temporárias",
+  "mode_one_shot_ideal": "Navegação em menus, ações únicas",
+  "mode_toggle_ideal": "Turbo, shift mode, funções ON/OFF",
+  "mode_long_press_ideal": "Funções especiais, reset, pairing",
   "select_serial_port": "Selecione uma porta serial.",
   "error_reading_board": "Erro ao ler da placa:",
   "read_ok_save_fail": "Leitura ok, mas falha ao salvar localmente:",
@@ -34,5 +42,10 @@
   "error_resetting": "Erro ao resetar:",
   "config_restored": "Configuração restaurada para padrão.",
   "config_saved": "Configuração salva localmente.",
-  "config_save_failed": "Falha ao salvar:"
+  "config_save_failed": "Falha ao salvar:",
+  "button_modes_title": "Modos dos Botões",
+  "close": "Fechar",
+  "ok": "OK",
+  "mode_help": "Ajuda",
+  "windows_joystick_note": "Windows: Leitura direta não disponível. Use SDL2 para suporte completo."
 }
