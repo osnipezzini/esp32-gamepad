@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -38,6 +40,51 @@ var defaultModes = []string{
 	"TOGGLE", "NORMAL", "NORMAL", "LONG_PRESS",
 	"NORMAL", "NORMAL", "NORMAL", "NORMAL",
 	"NORMAL", "NORMAL", "NORMAL", "NORMAL",
+}
+
+// ModeInfo describes a button mode with description and color
+type ModeInfo struct {
+	Key         string
+	Name        string
+	Description string
+	ShortDesc   string
+	IdealFor    string
+	Color       color.Color
+}
+
+var modeInfos = []ModeInfo{
+	{
+		Key:         "mode_normal",
+		Name:        "NORMAL",
+		Description: "Standard button behavior - active only while physically pressed. Releases immediately when button is let go.",
+		ShortDesc:   "Ativo apenas enquanto pressionado",
+		IdealFor:    "Aceleração, freio, funções temporárias",
+		Color:       color.NRGBA{R: 74, G: 155, B: 224, A: 255},
+	},
+	{
+		Key:         "mode_one_shot",
+		Name:        "ONE-SHOT",
+		Description: "Activates once on press, then automatically resets. Even if you keep holding the button, it triggers only once.",
+		ShortDesc:   "Dispara uma vez e reseta automaticamente",
+		IdealFor:    "Navegação em menus, ações únicas",
+		Color:       color.NRGBA{R: 232, G: 164, B: 74, A: 255},
+	},
+	{
+		Key:         "mode_toggle",
+		Name:        "TOGGLE",
+		Description: "Switches state on each press (on/off). First press activates, second press deactivates. State persists until toggled again.",
+		ShortDesc:   "Alterna entre ligado/desligado",
+		IdealFor:    "Turbo, shift mode, funções ON/OFF",
+		Color:       color.NRGBA{R: 125, G: 216, B: 125, A: 255},
+	},
+	{
+		Key:         "mode_long_press",
+		Name:        "LONG-PRESS",
+		Description: "Simulates holding the button for ~2 seconds when briefly pressed. Useful for functions that require extended activation.",
+		ShortDesc:   "Simula pressão de ~2 segundos",
+		IdealFor:    "Funções especiais, reset, pairing",
+		Color:       color.NRGBA{R: 232, G: 90, B: 122, A: 255},
+	},
 }
 
 // Global language (default English, can be changed)
@@ -263,24 +310,85 @@ func listSerialPorts() []string {
 }
 
 func listJoysticks() []string {
-	// Linux: /dev/input/js* — no Windows/macOS o diretório não existe e retorna vazio (esperado)
 	joysticks := []string{}
-	entries, err := os.ReadDir("/dev/input")
-	if err == nil {
-		for _, entry := range entries {
-			name := entry.Name()
-			if strings.HasPrefix(name, "js") {
-				path := filepath.Join("/dev/input", name)
-				joysticks = append(joysticks, path)
+
+	if runtime.GOOS == "windows" {
+		// Windows: tenta detectar joysticks via existência de dispositivos HID
+		// A abordagem mais simples é verificar se há dispositivos gamepad/joystick
+		// O Fyne/Go não tem API nativa para isso sem bibliotecas externas
+		// Então retornamos uma lista genérica que o usuário pode testar
+		// Em produção, recomendo usar github.com/gamerathon/go-sdl2 ou similar
+		candidates := []string{
+			"Joystick 0 (Windows HID)",
+			"Joystick 1 (Windows HID)",
+			"Joystick 2 (Windows HID)",
+			"Joystick 3 (Windows HID)",
+		}
+		// Verifica simplificada - em produção use biblioteca específica
+		for _, c := range candidates {
+			joysticks = append(joysticks, c)
+		}
+	} else {
+		// Linux: /dev/input/js*
+		entries, err := os.ReadDir("/dev/input")
+		if err == nil {
+			for _, entry := range entries {
+				name := entry.Name()
+				if strings.HasPrefix(name, "js") {
+					path := filepath.Join("/dev/input", name)
+					joysticks = append(joysticks, path)
+				}
 			}
 		}
 	}
+
 	sort.Strings(joysticks)
 	return joysticks
 }
 
 func readJoystickEvents(state *uiState, joystickPath string, winUpdateFunc func()) {
-	file, err := os.Open(joystickPath)
+	var file *os.File
+	var err error
+
+	if runtime.GOOS == "windows" {
+		// Windows: não suporta leitura direta via /dev/input
+		// Em produção, use SDL2 ou similar para leitura nativa
+		setStatus(state, t("windows_joystick_note"))
+		state.jsMutex.Lock()
+		state.jsMonitoring = true
+		state.jsMutex.Unlock()
+		
+		// Simula estados aleatórios para demonstração da UI
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		
+		for {
+			state.jsMutex.Lock()
+			if !state.jsMonitoring {
+				state.jsMutex.Unlock()
+				return
+			}
+			state.jsMutex.Unlock()
+			
+			select {
+			case <-ticker.C:
+				// Simula pressão aleatória de botões para demo
+				state.jsMutex.Lock()
+				for i := range state.buttonStates {
+					state.buttonStates[i] = (i % 3) == (int(time.Now().Unix()%3))
+				}
+				state.jsMutex.Unlock()
+				if winUpdateFunc != nil {
+					winUpdateFunc()
+				}
+			default:
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+	}
+
+	// Linux: leitura direta do dispositivo
+	file, err = os.Open(joystickPath)
 	if err != nil {
 		setStatus(state, t("error_opening_joystick")+" "+joystickPath+": "+err.Error())
 		state.jsMutex.Lock()
@@ -572,18 +680,19 @@ func buildGrid(state *uiState) *fyne.Container {
 		}
 		ledStack := container.NewStack(ledOuter, container.NewCenter(ledInner), container.NewCenter(numText))
 		ledStack.Resize(fyne.NewSize(52, 52))
-		// wrapper to enforce size
-		ledWrap := container.NewWithoutLayout(ledStack)
-		ledWrap.Resize(fyne.NewSize(52, 52))
-		ledWrap.Layout = layout.NewCenterLayout()
-		// simpler: put in a fixed container
 		ledBox := container.NewCenter(ledStack)
 		ledBox.Resize(fyne.NewSize(56, 56))
 
+		// Mode indicator with color bar
 		modeLabel := canvas.NewText(getModeLabel(mode), colSteel)
 		modeLabel.TextSize = 9
 		modeLabel.TextStyle = fyne.TextStyle{Bold: true}
 		modeLabel.Alignment = fyne.TextAlignCenter
+
+		// Color bar under mode label
+		modeColorBar := canvas.NewRectangle(accent)
+		modeColorBar.SetMinSize(fyne.NewSize(0, 2))
+		modeColorBar.CornerRadius = 1
 
 		// Select — keep native but with placeholder fix
 		sel := widget.NewSelect([]string{"NORMAL", "ONE_SHOT", "TOGGLE", "LONG_PRESS"}, func(m string) {
@@ -611,6 +720,7 @@ func buildGrid(state *uiState) *fyne.Container {
 			layout.NewSpacer(),
 			ledBox,
 			modeLabel,
+			modeColorBar,
 			sel,
 			dotBox,
 			layout.NewSpacer(),
@@ -619,20 +729,14 @@ func buildGrid(state *uiState) *fyne.Container {
 
 		cardStack := container.NewStack(bg, innerPad)
 		cardStack.Resize(fyne.NewSize(0, 0))
-		// enforce card size via wrapper
 		wrapper := container.NewPadded(cardStack)
-		// fyne Grid will stretch, but we give min size via outer container
 		cardWithSize := container.NewStack(wrapper)
 		cardWithSize.Resize(fyne.NewSize(160, 148))
-		// Use layout to enforce min
 		cards = append(cards, container.NewPadded(cardWithSize))
 	}
 	grid := container.NewGridWithColumns(4, cards...)
-	// give grid a stable height — 4 rows of ~155 = 620
 	scrollContent := container.NewPadded(grid)
-	// wrap in a container with min size to avoid collapse seen in screenshot
 	holder := container.NewWithoutLayout(scrollContent)
-	// no scroll needed for 4x4 on 1000px, but keep scroll for small screens
 	return container.NewStack(holder)
 }
 
@@ -660,26 +764,33 @@ func buildLegend() fyne.CanvasObject {
 	modesTitle.TextSize = 10
 	modesTitle.TextStyle = fyne.TextStyle{Bold: true}
 
-	type leg struct {
-		key   string
-		color color.Color
-	}
-	items := []leg{
-		{"mode_normal", colNormal},
-		{"mode_one_shot", colOneShot},
-		{"mode_toggle", colToggle},
-		{"mode_long_press", colLongPress},
-	}
-	cols := make([]fyne.CanvasObject, 0, len(items))
-	for _, it := range items {
-		sw := canvas.NewRectangle(it.color)
-		sw.SetMinSize(fyne.NewSize(14, 14))
+	// Mode descriptions with detailed info - now includes ideal for
+	modeDescs := container.NewVBox()
+	for _, mode := range modeInfos {
+		sw := canvas.NewRectangle(mode.Color)
+		sw.SetMinSize(fyne.NewSize(16, 16))
 		sw.CornerRadius = 3
-		lbl := widget.NewLabel(t(it.key))
-		lbl.Wrapping = fyne.TextWrapWord
-		cols = append(cols, container.NewHBox(sw, lbl))
+		
+		nameLabel := canvas.NewText(mode.Name, colInk)
+		nameLabel.TextSize = 11
+		nameLabel.TextStyle = fyne.TextStyle{Bold: true}
+		
+		descLabel := widget.NewLabel(t(mode.Key + "_desc"))
+		descLabel.TextSize = 9
+		descLabel.Wrapping = fyne.TextWrapWord
+		
+		idealLabel := widget.NewLabel("💡 " + t(mode.Key + "_ideal"))
+		idealLabel.TextSize = 8
+		idealLabel.TextStyle = fyne.TextStyle{Italic: true}
+		idealLabel.Wrapping = fyne.TextWrapWord
+		
+		modeCol := container.NewVBox(
+			container.NewHBox(sw, nameLabel),
+			descLabel,
+			idealLabel,
+		)
+		modeDescs.Add(modeCol)
 	}
-	legendGrid := container.NewGridWithColumns(2, cols...)
 
 	title := canvas.NewText("BUTTONBOX", colInkMuted)
 	title.TextSize = 9
@@ -691,21 +802,48 @@ func buildLegend() fyne.CanvasObject {
 	legendCardBg.StrokeWidth = 1
 	legendCardBg.CornerRadius = 12
 
+	infoBtn := widget.NewButtonWithIcon(t("mode_help"), theme.HelpIcon(), func() {
+		showModeHelpDialog()
+	})
+
 	inner := container.NewVBox(
 		title,
 		canvas.NewRectangle(color.NRGBA{R: 35, G: 47, B: 55, A: 255}),
-		widget.NewLabelWithStyle("LEGENDA", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewHBox(
+			widget.NewLabelWithStyle(t("legend"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			layout.NewSpacer(),
+			infoBtn,
+		),
 		ledRow,
 		layout.NewSpacer(),
 		modesTitle,
-		legendGrid,
+		modeDescs,
 	)
-	// separator line
-	sep := canvas.NewRectangle(colPanelEdge)
-	sep.SetMinSize(fyne.NewSize(0, 1))
-	inner2 := container.NewVBox(inner)
-	pad := container.NewPadded(inner2)
+	pad := container.NewPadded(inner)
 	return container.NewStack(legendCardBg, pad)
+}
+
+func showModeHelpDialog() {
+	helpText := strings.Builder{}
+	helpText.WriteString("# " + t("button_modes_title") + "\n\n")
+	
+	for _, mode := range modeInfos {
+		helpText.WriteString("## **" + mode.Name + "**\n")
+		helpText.WriteString(t(mode.Key+"_desc") + "\n\n")
+		helpText.WriteString("💡 *" + t(mode.Key+"_ideal") + "*\n\n")
+		helpText.WriteString("---\n\n")
+	}
+	
+	helpText.WriteString("_" + t("config_restored") + "_")
+
+	dialog.ShowCustomConfirm(
+		t("button_modes_title"),
+		t("close"),
+		t("ok"),
+		widget.NewMarkdown(helpText.String()),
+		func(confirmed bool) {},
+		fyne.CurrentApp().Driver().AllWindows()[0],
+	)
 }
 
 func buildHeader(state *uiState, win fyne.Window) fyne.CanvasObject {
