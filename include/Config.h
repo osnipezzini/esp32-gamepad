@@ -43,7 +43,7 @@ static ButtonMode BUTTON_MODES[BUTTON_COUNT] = {
     /* 9*/ ButtonMode::NORMAL,
     /*10*/ ButtonMode::NORMAL,
     /*11*/ ButtonMode::NORMAL,
-    /*12*/ ButtonMode::NORMAL,
+    /*12*/ ButtonMode::TWO_SHOT,     // segurar = apenas 1 pulso curto (press+release)
     /*13*/ ButtonMode::NORMAL,
     /*14*/ ButtonMode::NORMAL,
     /*15*/ ButtonMode::NORMAL,
@@ -58,6 +58,7 @@ inline ButtonMode decodeButtonMode(uint8_t raw) {
         case static_cast<uint8_t>(ButtonMode::ONE_SHOT): return ButtonMode::ONE_SHOT;
         case static_cast<uint8_t>(ButtonMode::TOGGLE): return ButtonMode::TOGGLE;
         case static_cast<uint8_t>(ButtonMode::LONG_PRESS): return ButtonMode::LONG_PRESS;
+        case static_cast<uint8_t>(ButtonMode::TWO_SHOT): return ButtonMode::TWO_SHOT;
         case static_cast<uint8_t>(ButtonMode::NORMAL):
         default: return ButtonMode::NORMAL;
     }
@@ -87,6 +88,7 @@ inline const char* buttonModeToString(ButtonMode mode) {
         case ButtonMode::ONE_SHOT: return "ONE_SHOT";
         case ButtonMode::TOGGLE: return "TOGGLE";
         case ButtonMode::LONG_PRESS: return "LONG_PRESS";
+        case ButtonMode::TWO_SHOT: return "TWO_SHOT";
         case ButtonMode::NORMAL:
         default: return "NORMAL";
     }
@@ -105,6 +107,11 @@ inline ButtonMode parseButtonModeString(const char* value) {
     if (strcmp(normalized, "ONE_SHOT") == 0) return ButtonMode::ONE_SHOT;
     if (strcmp(normalized, "TOGGLE") == 0) return ButtonMode::TOGGLE;
     if (strcmp(normalized, "LONG_PRESS") == 0) return ButtonMode::LONG_PRESS;
+    if (strcmp(normalized, "TWO_SHOT") == 0) return ButtonMode::TWO_SHOT;
+    // aliases amigáveis
+    if (strcmp(normalized, "TWO_WAY_SHOT") == 0) return ButtonMode::TWO_SHOT;
+    if (strcmp(normalized, "TWO_WAY") == 0) return ButtonMode::TWO_SHOT;
+    if (strcmp(normalized, "DUAL_SHOT") == 0) return ButtonMode::TWO_SHOT;
     return ButtonMode::NORMAL;
 }
 
@@ -171,6 +178,8 @@ inline void loadButtonModesFromStorage() {
 
 static const uint32_t DEBOUNCE_MS             = 12;
 static const uint32_t ONE_SHOT_PULSE_MS       = 80;
+static const uint32_t TWO_SHOT_PULSE_MS       = 80;  // mesmo pulso do ONE_SHOT, mas dispara 2x (press+release)
+static const uint32_t TWO_SHOT_GAP_MS         = 30;  // gap entre os dois pulsos quando soltura ocorre durante o 1º pulso
 static const uint32_t LONG_PRESS_THRESHOLD_MS = 500;
 
 // Loop principal: intervalo entre leituras/envios de report (125 Hz aprox.)

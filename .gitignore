@@ -69,3 +69,4 @@ Thumbs.db
 *.tar.xz
 *.tar.zst
 ```
+tools/config-gui/buttonbox-config.json

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image/color"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,7 +23,9 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	serial "go.bug.st/serial"
+	hid "github.com/karalabe/hid"
+	"go.bug.st/serial"
+	"go.bug.st/serial/enumerator"
 )
 
 const totalButtons = 16
@@ -68,6 +71,14 @@ var modeInfos = []ModeInfo{
 		ShortDesc:   "Dispara uma vez e reseta automaticamente",
 		IdealFor:    "Navegação em menus, ações únicas",
 		Color:       color.NRGBA{R: 232, G: 164, B: 74, A: 255},
+	},
+	{
+		Key:         "mode_two_shot",
+		Name:        "TWO-SHOT",
+		Description: "Fires once on press and again on release (two pulses). Useful for gear shifts, blinkers, or any action that needs press + release.",
+		ShortDesc:   "Dispara ao pressionar e ao soltar",
+		IdealFor:    "Marcha, seta, ações press+release",
+		Color:       color.NRGBA{R: 155, G: 125, B: 232, A: 255},
 	},
 	{
 		Key:         "mode_toggle",
@@ -138,6 +149,10 @@ type ButtonConfig struct {
 	Mode  string `json:"mode"`
 }
 
+var hidPathByDisplay = map[string]string{}
+var hidDisplayByPath = map[string]string{}
+var hidSerialByDisplay = map[string]string{}
+
 type uiState struct {
 	config           []ButtonConfig
 	buttonStates     []bool // true = pressed, false = released
@@ -153,12 +168,19 @@ type uiState struct {
 	jsUpdateCallback func([]bool)
 	jsMonitoring     bool
 	jsMutex          sync.Mutex
+	// refs para refresh incremental sem rebuild (evita tremor) — agora barra horizontal
+	gridBars []*canvas.Rectangle
 }
 
 func normalizeMode(raw string) string {
 	switch strings.ToUpper(strings.TrimSpace(raw)) {
-	case "NORMAL", "ONE_SHOT", "TOGGLE", "LONG_PRESS":
-		return strings.ToUpper(strings.TrimSpace(raw))
+	case "NORMAL", "ONE_SHOT", "TWO_SHOT", "TWO_WAY_SHOT", "TWO_WAY", "DUAL_SHOT", "TOGGLE", "LONG_PRESS":
+		m := strings.ToUpper(strings.TrimSpace(raw))
+		// canonicaliza aliases para TWO_SHOT
+		if m == "TWO_WAY_SHOT" || m == "TWO_WAY" || m == "DUAL_SHOT" {
+			return "TWO_SHOT"
+		}
+		return m
 	default:
 		return "NORMAL"
 	}
@@ -224,35 +246,14 @@ func localesDir() string {
 }
 
 func loadStoredConfig() []ButtonConfig {
-	path := configFilePath()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return buildDefaultConfig()
-	}
-
-	var payload map[string][]ButtonConfig
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return buildDefaultConfig()
-	}
-
-	cfg, ok := payload["buttons"]
-	if !ok || len(cfg) != totalButtons {
-		return buildDefaultConfig()
-	}
-	for i := range cfg {
-		cfg[i].Index = i
-		cfg[i].Mode = normalizeMode(cfg[i].Mode)
-	}
-	return cfg
+	// sem cache local — sempre inicia com defaults, leitura real vem do dispositivo via Read
+	return buildDefaultConfig()
 }
 
 func persistLocalConfig(cfg []ButtonConfig) error {
-	payload := map[string][]ButtonConfig{"buttons": cfg}
-	data, err := json.MarshalIndent(payload, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(configFilePath(), data, 0o644)
+	// sem cache local — mantém em memória e no dispositivo via Apply
+	_ = cfg
+	return nil
 }
 
 func exportCPP(cfg []ButtonConfig) string {
@@ -311,57 +312,277 @@ func listSerialPorts() []string {
 
 func listJoysticks() []string {
 	joysticks := []string{}
-
 	if runtime.GOOS == "windows" {
-		// Windows: tenta detectar joysticks via existência de dispositivos HID
-		// A abordagem mais simples é verificar se há dispositivos gamepad/joystick
-		// O Fyne/Go não tem API nativa para isso sem bibliotecas externas
-		// Então retornamos uma lista genérica que o usuário pode testar
-		// Em produção, recomendo usar github.com/gamerathon/go-sdl2 ou similar
-		candidates := []string{
-			"Joystick 0 (Windows HID)",
-			"Joystick 1 (Windows HID)",
-			"Joystick 2 (Windows HID)",
-			"Joystick 3 (Windows HID)",
+		// Windows: usa winmm joyGetDevCaps (sem hidapi) — mostra nome real e ID
+		if lst, m := winmmListJoysticks(); len(lst) > 0 {
+			// winmmListJoysticks já preenche hidPathByDisplay
+			_ = m
+			return lst
 		}
-		// Verifica simplificada - em produção use biblioteca específica
-		for _, c := range candidates {
-			joysticks = append(joysticks, c)
+		// fallback HID se winmm não achar (ex: ButtonBox BLE que não é winmm)
+		hidPathByDisplay = map[string]string{}
+		hidDisplayByPath = map[string]string{}
+		seen := map[string]bool{}
+		addWin := func(d hid.DeviceInfo) {
+			name := d.Product
+			if name == "" {
+				name = d.Manufacturer
+				if name == "" {
+					name = "HID Joystick"
+				}
+			}
+			if name == "Arduino Leonardo" {
+				name = "ButtonBox"
+			}
+			display := fmt.Sprintf("%s (%04x:%04x)", name, d.VendorID, d.ProductID)
+			if seen[display] {
+				return
+			}
+			seen[display] = true
+			hidPathByDisplay[display] = d.Path
+			hidDisplayByPath[d.Path] = display
+			joysticks = append(joysticks, display)
 		}
-	} else {
-		// Linux: /dev/input/js*
-		entries, err := os.ReadDir("/dev/input")
-		if err == nil {
-			for _, entry := range entries {
-				name := entry.Name()
-				if strings.HasPrefix(name, "js") {
-					path := filepath.Join("/dev/input", name)
-					joysticks = append(joysticks, path)
+		for _, d := range hid.Enumerate(0, 0) {
+			if d.UsagePage == 0x01 && (d.Usage == 0x04 || d.Usage == 0x05 || d.Usage == 0x08) {
+				addWin(d)
+			}
+		}
+		if len(joysticks) == 0 {
+			for _, d := range hid.Enumerate(0, 0) {
+				lowerProd := strings.ToLower(d.Product)
+				lowerMan := strings.ToLower(d.Manufacturer)
+				if strings.Contains(lowerProd, "joystick") || strings.Contains(lowerProd, "gamepad") || strings.Contains(lowerProd, "buttonbox") || strings.Contains(lowerProd, "controller") ||
+					strings.Contains(lowerMan, "buttonbox") || strings.Contains(lowerProd, "leonardo") || strings.Contains(lowerProd, "pro micro") {
+					addWin(d)
 				}
 			}
 		}
+		sort.Strings(joysticks)
+		return joysticks
 	}
-
+	// Linux: lista /dev/input/js* com nome e vendor:product reais
+	entries, err := os.ReadDir("/dev/input")
+	if err == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasPrefix(name, "js") {
+				continue
+			}
+			devPath := filepath.Join("/dev/input", name)
+			display := devPath
+			sysBase := filepath.Join("/sys/class/input", name, "device")
+			if data, err := os.ReadFile(filepath.Join(sysBase, "name")); err == nil {
+				devName := strings.TrimSpace(string(data))
+				if devName != "" {
+					vendor, _ := os.ReadFile(filepath.Join(sysBase, "id", "vendor"))
+					product, _ := os.ReadFile(filepath.Join(sysBase, "id", "product"))
+					v := strings.TrimSpace(string(vendor))
+					p := strings.TrimSpace(string(product))
+					if v != "" && p != "" {
+						display = fmt.Sprintf("%s — %s (%s:%s)", devPath, devName, v, p)
+					} else {
+						display = fmt.Sprintf("%s — %s", devPath, devName)
+					}
+				}
+			}
+			joysticks = append(joysticks, display)
+		}
+	}
 	sort.Strings(joysticks)
 	return joysticks
 }
 
+func parseVIDPID(display string) (uint16, uint16) {
+	// display like "ButtonBox (2341:8036) [ID 0]" -> extrai 2341:8036
+	start := strings.LastIndex(display, "(")
+	end := strings.LastIndex(display, ")")
+	if start >= 0 && end > start {
+		inner := display[start+1 : end]
+		parts := strings.Split(inner, ":")
+		if len(parts) == 2 {
+			var v, p uint64
+			fmt.Sscanf(parts[0], "%04x", &v)
+			fmt.Sscanf(parts[1], "%04x", &p)
+			// fallback decimal
+			if v == 0 {
+				fmt.Sscanf(parts[0], "%d", &v)
+			}
+			if p == 0 {
+				fmt.Sscanf(parts[1], "%d", &p)
+			}
+			return uint16(v), uint16(p)
+		}
+	}
+	return 0, 0
+}
+
+var cachedSerialPort string
+var cachedSerialPortTime time.Time
+var serialMu sync.Mutex
+
+func isButtonBoxPort(port string) bool {
+	serialMu.Lock()
+	defer serialMu.Unlock()
+	if p, err := serial.Open(port, &serial.Mode{BaudRate: 115200}); err == nil {
+		defer p.Close()
+		_ = p.SetDTR(false)
+		time.Sleep(200 * time.Millisecond)
+		_ = p.ResetInputBuffer()
+		p.SetReadTimeout(200 * time.Millisecond)
+		drain := make([]byte, 512)
+		for i := 0; i < 2; i++ {
+			n, _ := p.Read(drain)
+			if n > 0 {
+				log.Printf("isButtonBoxPort %s dreno %d %q", port, n, string(drain[:n]))
+			}
+			if n == 0 {
+				break
+			}
+		}
+		if _, err := p.Write([]byte("GET\n")); err != nil {
+			log.Printf("isButtonBoxPort %s write FAIL %v", port, err)
+			return false
+		}
+		log.Printf("isButtonBoxPort %s GET enviado", port)
+		var acc string
+		buf := make([]byte, 512)
+		deadline := time.Now().Add(1200 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			n, _ := p.Read(buf)
+			if n > 0 {
+				chunk := string(buf[:n])
+				acc += chunk
+				log.Printf("isButtonBoxPort %s chunk %d %q acc=%q", port, n, chunk, acc)
+				if strings.Count(acc, "=") >= 1 {
+					break
+				}
+			} else {
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		s := acc
+		ok := strings.Count(s, "=") >= 1
+		log.Printf("isButtonBoxPort %s final %q ok=%v", port, s, ok)
+		return ok
+	}
+	log.Printf("isButtonBoxPort %s open FAIL", port)
+	return false
+}
+
+func resolveSerialPort(state *uiState) string {
+	log.Printf("resolveSerialPort: ports=%v selectedPort=%q selectedJoystick=%q", state.ports, state.selectedPort, state.selectedJoystick)
+	// inverte cache se não for mais ButtonBox (ex: COM1 fantasma)
+	if cachedSerialPort != "" && time.Since(cachedSerialPortTime) < 5*time.Second {
+		for _, p := range state.ports {
+			if p == cachedSerialPort {
+				if isButtonBoxPort(p) {
+					log.Printf("resolveSerialPort: usando cache %s", p)
+					return p
+				}
+				log.Printf("resolveSerialPort: cache %s não é ButtonBox, invalidando", p)
+				cachedSerialPort = ""
+				break
+			}
+		}
+	}
+	// atualiza lista de portas (pode ter plugado/desplugado)
+	state.ports = listSerialPorts()
+	log.Printf("resolveSerialPort: lista atualizada %v", state.ports)
+	if len(state.ports) == 0 {
+		log.Printf("resolveSerialPort: nenhuma porta")
+		return ""
+	}
+	// 1. se usuário selecionou manualmente e ainda existe E é ButtonBox, usa
+	if state.selectedPort != "" {
+		for _, p := range state.ports {
+			if p == state.selectedPort && isButtonBoxPort(p) {
+				cachedSerialPort = p
+				cachedSerialPortTime = time.Now()
+				log.Printf("resolveSerialPort: usando selectedPort %s", p)
+				return p
+			}
+		}
+		log.Printf("resolveSerialPort: selectedPort %q não é ButtonBox, ignorando", state.selectedPort)
+	}
+	// 2. tenta match direto por VID:PID do joystick selecionado (não adivinha)
+	if state.selectedJoystick != "" {
+		vid, pid := parseVIDPID(state.selectedJoystick)
+		if vid != 0 || pid != 0 {
+			if details, err := enumerator.GetDetailedPortsList(); err == nil {
+				for _, d := range details {
+					if strings.EqualFold(d.VID, fmt.Sprintf("%04x", vid)) && strings.EqualFold(d.PID, fmt.Sprintf("%04x", pid)) {
+						log.Printf("resolveSerialPort: match VID:PID %04x:%04x -> %s", vid, pid, d.Name)
+						cachedSerialPort = d.Name
+						cachedSerialPortTime = time.Now()
+						return d.Name
+					}
+				}
+				// fallback case-insensitive sem zero pad
+				for _, d := range details {
+					var dv, dp uint64
+					fmt.Sscanf(d.VID, "%x", &dv)
+					fmt.Sscanf(d.PID, "%x", &dp)
+					if uint16(dv) == vid && uint16(dp) == pid {
+						log.Printf("resolveSerialPort: match VID:PID %04x:%04x -> %s (2)", vid, pid, d.Name)
+						cachedSerialPort = d.Name
+						cachedSerialPortTime = time.Now()
+						return d.Name
+					}
+				}
+			}
+		}
+	}
+	// 3. brute-force só se VID:PID não achou
+	for _, port := range state.ports {
+		log.Printf("resolveSerialPort: testando %s", port)
+		if isButtonBoxPort(port) {
+			log.Printf("resolveSerialPort: %s parece ButtonBox", port)
+			cachedSerialPort = port
+			cachedSerialPortTime = time.Now()
+			return port
+		}
+		log.Printf("resolveSerialPort: %s sem resposta ButtonBox", port)
+	}
+	// 3. fallback: se só há uma porta, usa ela
+	if len(state.ports) == 1 {
+		cachedSerialPort = state.ports[0]
+		cachedSerialPortTime = time.Now()
+		return state.ports[0]
+	}
+	// 4. último fallback: primeira porta
+	cachedSerialPort = state.ports[0]
+	cachedSerialPortTime = time.Now()
+	return state.ports[0]
+}
+
 func readJoystickEvents(state *uiState, joystickPath string, winUpdateFunc func()) {
-	var file *os.File
-	var err error
+	// Windows display agora é "ButtonBox (2341:8036)" — resolve para Path real via mapa
+	hidPath := hidPathByDisplay[joystickPath]
+	if hidPath == "" {
+		// compat: formato antigo "PATH — Nome (vid:pid)" ou Linux "/dev/input/js0 — Nome"
+		tmp := joystickPath
+		if idx := strings.Index(joystickPath, " —"); idx > 0 {
+			tmp = strings.TrimSpace(joystickPath[:idx])
+		}
+		if alt, ok := hidPathByDisplay[tmp]; ok {
+			hidPath = alt
+		} else {
+			hidPath = tmp
+		}
+	}
+	realPath := hidPath
+	if realPath == "" {
+		realPath = joystickPath
+	}
 
 	if runtime.GOOS == "windows" {
-		// Windows: não suporta leitura direta via /dev/input
-		// Em produção, use SDL2 ou similar para leitura nativa
-		setStatus(state, t("windows_joystick_note"))
+		// Windows: usa winmm joyGetPosEx (não hidapi cru) — leitura correta sem offset
+		joyID := winmmParseJoyID(joystickPath)
 		state.jsMutex.Lock()
 		state.jsMonitoring = true
 		state.jsMutex.Unlock()
-		
-		// Simula estados aleatórios para demonstração da UI
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		
+		setStatus(state, t("monitoring")+" "+joystickPath)
 		for {
 			state.jsMutex.Lock()
 			if !state.jsMonitoring {
@@ -369,28 +590,39 @@ func readJoystickEvents(state *uiState, joystickPath string, winUpdateFunc func(
 				return
 			}
 			state.jsMutex.Unlock()
-			
-			select {
-			case <-ticker.C:
-				// Simula pressão aleatória de botões para demo
-				state.jsMutex.Lock()
-				for i := range state.buttonStates {
-					state.buttonStates[i] = (i % 3) == (int(time.Now().Unix()%3))
-				}
-				state.jsMutex.Unlock()
-				if winUpdateFunc != nil {
-					winUpdateFunc()
-				}
-			default:
-				time.Sleep(50 * time.Millisecond)
+			buttons, err := winmmReadButtons(joyID)
+			if err != nil {
+				// tenta HID como fallback se winmm falhar (ex: BLE que não é winmm)
+				// fallback para HID já foi enumerado, mas winmm deve cobrir 99%
+				setStatus(state, t("error_reading_joystick")+": "+err.Error())
+				// não sai, tenta novamente em 100ms
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
+			for i := 0; i < totalButtons; i++ {
+				pressed := (buttons>>uint(i))&1 == 1
+				state.jsMutex.Lock()
+				state.buttonStates[i] = pressed
+				state.jsMutex.Unlock()
+				if i < len(state.gridBars) {
+					if pressed {
+						state.gridBars[i].FillColor = colLedOn
+					} else {
+						state.gridBars[i].FillColor = colLedOff
+					}
+					state.gridBars[i].Refresh()
+				}
+			}
+			time.Sleep(16 * time.Millisecond)
 		}
 	}
+	var file *os.File
+	var err error
 
 	// Linux: leitura direta do dispositivo
-	file, err = os.Open(joystickPath)
+	file, err = os.Open(realPath)
 	if err != nil {
-		setStatus(state, t("error_opening_joystick")+" "+joystickPath+": "+err.Error())
+		setStatus(state, t("error_opening_joystick")+" "+realPath+": "+err.Error())
 		state.jsMutex.Lock()
 		state.jsMonitoring = false
 		state.jsMutex.Unlock()
@@ -436,13 +668,19 @@ func readJoystickEvents(state *uiState, joystickPath string, winUpdateFunc func(
 
 		if (jsType & 0x01) != 0 { // Button event
 			if jsNumber < totalButtons {
+				pressed := buf[4] != 0
 				state.jsMutex.Lock()
-				state.buttonStates[jsNumber] = (buf[4] != 0)
+				state.buttonStates[jsNumber] = pressed
 				state.jsMutex.Unlock()
 
-				// Trigger UI update
-				if winUpdateFunc != nil {
-					winUpdateFunc()
+				// barra horizontal — sem círculo, evita tremor
+				if int(jsNumber) < len(state.gridBars) {
+					if pressed {
+						state.gridBars[jsNumber].FillColor = colLedOn
+					} else {
+						state.gridBars[jsNumber].FillColor = colLedOff
+					}
+					state.gridBars[jsNumber].Refresh()
 				}
 			}
 		}
@@ -453,18 +691,44 @@ func applyButtonConfigToSerial(portName string, cfg []ButtonConfig) error {
 	if strings.TrimSpace(portName) == "" {
 		return fmt.Errorf("serial port not informed")
 	}
+	serialMu.Lock()
+	log.Printf("applyButtonConfigToSerial: %s com %d modos", portName, len(cfg))
 	p, err := serial.Open(portName, &serial.Mode{BaudRate: 115200})
 	if err != nil {
+		serialMu.Unlock()
 		return err
 	}
-	defer p.Close()
+	_ = p.SetDTR(false)
+	time.Sleep(300 * time.Millisecond)
+	_ = p.ResetInputBuffer()
+	_ = p.ResetOutputBuffer()
+	p.SetReadTimeout(100 * time.Millisecond)
+	drain := make([]byte, 512)
+	for i := 0; i < 2; i++ {
+		n, _ := p.Read(drain)
+		if n == 0 {
+			break
+		}
+		log.Printf("apply: dreno %d bytes: %q", n, string(drain[:n]))
+	}
 	for _, item := range cfg {
 		line := fmt.Sprintf("%d=%s\n", item.Index, normalizeMode(item.Mode))
+		log.Printf("apply: -> %q", line)
 		if _, err := p.Write([]byte(line)); err != nil {
+			p.Close()
+			serialMu.Unlock()
 			return err
+		}
+		p.SetReadTimeout(200 * time.Millisecond)
+		n, _ := p.Read(drain)
+		if n > 0 {
+			log.Printf("apply: <- %q", string(drain[:n]))
 		}
 		time.Sleep(30 * time.Millisecond)
 	}
+	p.Close()
+	serialMu.Unlock()
+	log.Printf("apply: concluído")
 	return nil
 }
 
@@ -472,23 +736,45 @@ func readButtonConfigFromSerial(portName string) ([]ButtonConfig, error) {
 	if strings.TrimSpace(portName) == "" {
 		return nil, fmt.Errorf("serial port not informed")
 	}
+	serialMu.Lock()
+	log.Printf("readButtonConfigFromSerial: %s", portName)
 	p, err := serial.Open(portName, &serial.Mode{BaudRate: 115200})
 	if err != nil {
+		serialMu.Unlock()
 		return nil, err
 	}
-	defer p.Close()
+	_ = p.SetDTR(false)
+	time.Sleep(300 * time.Millisecond)
+	_ = p.ResetInputBuffer()
+	_ = p.ResetOutputBuffer()
+	p.SetReadTimeout(100 * time.Millisecond)
+	drain := make([]byte, 512)
+	for i := 0; i < 2; i++ {
+		n, _ := p.Read(drain)
+		if n > 0 {
+			log.Printf("read: dreno %d %q", n, string(drain[:n]))
+		}
+		if n == 0 {
+			break
+		}
+	}
 	if _, err := p.Write([]byte("GET\n")); err != nil {
+		p.Close()
+		serialMu.Unlock()
 		return nil, err
 	}
-	p.SetReadTimeout(200 * time.Millisecond)
+	log.Printf("read: GET enviado")
+	p.SetReadTimeout(500 * time.Millisecond)
 	result := make([]ButtonConfig, 0, totalButtons)
 	for len(result) < totalButtons {
-		buf := make([]byte, 128)
+		buf := make([]byte, 256)
 		n, err := p.Read(buf)
 		if err != nil {
 			if strings.Contains(err.Error(), "timeout") {
 				break
 			}
+			p.Close()
+			serialMu.Unlock()
 			return nil, err
 		}
 		if n <= 0 {
@@ -512,9 +798,14 @@ func readButtonConfigFromSerial(portName string) ([]ButtonConfig, error) {
 		}
 	}
 	if len(result) != totalButtons {
+		p.Close()
+		serialMu.Unlock()
 		return nil, fmt.Errorf("device returned incomplete configuration")
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Index < result[j].Index })
+	p.Close()
+	serialMu.Unlock()
+	log.Printf("read: %d modos lidos", len(result))
 	return result, nil
 }
 
@@ -592,9 +883,8 @@ func newUIState() *uiState {
 	}
 	_ = state.status.Set(t("ready"))
 	setExport(state)
-	if len(state.ports) > 0 {
-		state.selectedPort = state.ports[0]
-	}
+	// não pré-seleciona COM1 (pode ser porta da placa-mãe) — deixa vazio para auto-detecção via HID
+	// selectedPort ficará vazio e resolveSerialPort fará brute-force
 	if len(state.joysticks) > 0 {
 		state.selectedJoystick = state.joysticks[0]
 	}
@@ -613,6 +903,7 @@ var (
 	colAccent     = color.NRGBA{R: 255, G: 138, B: 24, A: 255} // amber signature
 	colNormal     = color.NRGBA{R: 74, G: 155, B: 224, A: 255}
 	colOneShot    = color.NRGBA{R: 232, G: 164, B: 74, A: 255}
+	colTwoShot    = color.NRGBA{R: 155, G: 125, B: 232, A: 255}
 	colToggle     = color.NRGBA{R: 125, G: 216, B: 125, A: 255}
 	colLongPress  = color.NRGBA{R: 232, G: 90, B: 122, A: 255}
 	colLedOff     = color.NRGBA{R: 45, G: 58, B: 68, A: 255}
@@ -627,6 +918,8 @@ func getModeColor(mode string) color.Color {
 		return colNormal
 	case "ONE_SHOT":
 		return colOneShot
+	case "TWO_SHOT":
+		return colTwoShot
 	case "TOGGLE":
 		return colToggle
 	case "LONG_PRESS":
@@ -642,6 +935,8 @@ func getModeLabel(mode string) string {
 		return "NORMAL"
 	case "ONE_SHOT":
 		return "ONE-SHOT"
+	case "TWO_SHOT":
+		return "TWO-SHOT"
 	case "TOGGLE":
 		return "TOGGLE"
 	case "LONG_PRESS":
@@ -652,6 +947,8 @@ func getModeLabel(mode string) string {
 }
 
 func buildGrid(state *uiState) *fyne.Container {
+	// barra horizontal preenche toda a largura do card — sem círculo
+	state.gridBars = make([]*canvas.Rectangle, 0, totalButtons)
 	cards := make([]fyne.CanvasObject, 0, totalButtons)
 	for i, item := range state.config {
 		idx := i
@@ -659,43 +956,32 @@ func buildGrid(state *uiState) *fyne.Container {
 		isPressed := i < len(state.buttonStates) && state.buttonStates[i]
 		accent := getModeColor(mode)
 
-		// hairline top signature
 		accentBar := canvas.NewRectangle(accent)
 		accentBar.SetMinSize(fyne.NewSize(0, 3))
+		accentBar.CornerRadius = 2
 
-		// number badge + LED ring
 		numText := canvas.NewText(fmt.Sprintf("%02d", item.Index), colInk)
 		numText.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
-		numText.TextSize = 18
+		numText.TextSize = 22
 		numText.Alignment = fyne.TextAlignCenter
 
-		ledOuter := canvas.NewCircle(colLedGlowOff)
-		ledInner := canvas.NewCircle(colLedOff)
-		ledInner.StrokeColor = colPanelEdge
-		ledInner.StrokeWidth = 1.5
+		// LED agora é barra horizontal que preenche o card (10px, cantos 4)
+		ledBar := canvas.NewRectangle(colLedOff)
 		if isPressed {
-			ledOuter.FillColor = colLedGlowOn
-			ledInner.FillColor = colLedOn
-			ledInner.StrokeColor = color.NRGBA{R: 80, G: 20, B: 20, A: 255}
+			ledBar.FillColor = colLedOn
 		}
-		ledStack := container.NewStack(ledOuter, container.NewCenter(ledInner), container.NewCenter(numText))
-		ledStack.Resize(fyne.NewSize(52, 52))
-		ledBox := container.NewCenter(ledStack)
-		ledBox.Resize(fyne.NewSize(56, 56))
+		ledBar.SetMinSize(fyne.NewSize(0, 10))
+		ledBar.CornerRadius = 4
+		ledBar.StrokeColor = colPanelEdge
+		ledBar.StrokeWidth = 1
+		state.gridBars = append(state.gridBars, ledBar)
 
-		// Mode indicator with color bar
 		modeLabel := canvas.NewText(getModeLabel(mode), colSteel)
 		modeLabel.TextSize = 9
 		modeLabel.TextStyle = fyne.TextStyle{Bold: true}
 		modeLabel.Alignment = fyne.TextAlignCenter
 
-		// Color bar under mode label
-		modeColorBar := canvas.NewRectangle(accent)
-		modeColorBar.SetMinSize(fyne.NewSize(0, 2))
-		modeColorBar.CornerRadius = 1
-
-		// Select — keep native but with placeholder fix
-		sel := widget.NewSelect([]string{"NORMAL", "ONE_SHOT", "TOGGLE", "LONG_PRESS"}, func(m string) {
+		sel := widget.NewSelect([]string{"NORMAL", "ONE_SHOT", "TWO_SHOT", "TOGGLE", "LONG_PRESS"}, func(m string) {
 			state.config[idx].Mode = normalizeMode(m)
 			_ = persistLocalConfig(state.config)
 			setExport(state)
@@ -704,12 +990,6 @@ func buildGrid(state *uiState) *fyne.Container {
 		sel.SetSelected(mode)
 		sel.PlaceHolder = "Modo"
 
-		// status dot under select
-		dot := canvas.NewCircle(accent)
-		dot.Resize(fyne.NewSize(8, 8))
-		dotBox := container.NewCenter(dot)
-
-		// card background + border
 		bg := canvas.NewRectangle(colPanel)
 		bg.StrokeColor = colPanelEdge
 		bg.StrokeWidth = 1
@@ -717,27 +997,21 @@ func buildGrid(state *uiState) *fyne.Container {
 
 		inner := container.NewVBox(
 			accentBar,
-			layout.NewSpacer(),
-			ledBox,
+			container.NewPadded(numText),
+			ledBar,
 			modeLabel,
-			modeColorBar,
 			sel,
-			dotBox,
-			layout.NewSpacer(),
 		)
 		innerPad := container.NewPadded(inner)
 
 		cardStack := container.NewStack(bg, innerPad)
-		cardStack.Resize(fyne.NewSize(0, 0))
 		wrapper := container.NewPadded(cardStack)
 		cardWithSize := container.NewStack(wrapper)
-		cardWithSize.Resize(fyne.NewSize(160, 148))
+		cardWithSize.Resize(fyne.NewSize(160, 135))
 		cards = append(cards, container.NewPadded(cardWithSize))
 	}
 	grid := container.NewGridWithColumns(4, cards...)
-	scrollContent := container.NewPadded(grid)
-	holder := container.NewWithoutLayout(scrollContent)
-	return container.NewStack(holder)
+	return container.NewPadded(grid)
 }
 
 func buildLegend() fyne.CanvasObject {
@@ -770,18 +1044,18 @@ func buildLegend() fyne.CanvasObject {
 		sw := canvas.NewRectangle(mode.Color)
 		sw.SetMinSize(fyne.NewSize(16, 16))
 		sw.CornerRadius = 3
-		
+
 		nameLabel := canvas.NewText(mode.Name, colInk)
 		nameLabel.TextSize = 11
 		nameLabel.TextStyle = fyne.TextStyle{Bold: true}
-		
+
 		descLabel := widget.NewLabel(t(mode.Key + "_desc"))
 		descLabel.Wrapping = fyne.TextWrapWord
-		
-		idealLabel := widget.NewLabel("💡 " + t(mode.Key + "_ideal"))
+
+		idealLabel := widget.NewLabel("💡 " + t(mode.Key+"_ideal"))
 		idealLabel.TextStyle = fyne.TextStyle{Italic: true}
 		idealLabel.Wrapping = fyne.TextWrapWord
-		
+
 		modeCol := container.NewVBox(
 			container.NewHBox(sw, nameLabel),
 			descLabel,
@@ -824,19 +1098,19 @@ func buildLegend() fyne.CanvasObject {
 func showModeHelpDialog() {
 	helpText := strings.Builder{}
 	helpText.WriteString("# " + t("button_modes_title") + "\n\n")
-	
+
 	for _, mode := range modeInfos {
 		helpText.WriteString("## **" + mode.Name + "**\n")
 		helpText.WriteString(t(mode.Key+"_desc") + "\n\n")
 		helpText.WriteString("💡 *" + t(mode.Key+"_ideal") + "*\n\n")
 		helpText.WriteString("---\n\n")
 	}
-	
+
 	helpText.WriteString("_" + t("config_restored") + "_")
 
 	// Use simple label instead of markdown widget (not available in Fyne 2.x)
 	content := widget.NewLabel(helpText.String())
-	
+
 	dialog.ShowCustomConfirm(
 		t("button_modes_title"),
 		t("close"),
@@ -888,124 +1162,124 @@ func buildHeader(state *uiState, win fyne.Window) fyne.CanvasObject {
 }
 
 func buildDeck(state *uiState, win fyne.Window) fyne.CanvasObject {
-	ports := state.ports
-	if len(ports) == 0 {
-		ports = []string{t("no_ports_detected")}
-	}
-	portSel := widget.NewSelect(ports, func(v string) { state.selectedPort = v })
-	if state.selectedPort != "" {
-		portSel.SetSelected(state.selectedPort)
-	} else if len(ports) > 0 {
-		portSel.SetSelected(ports[0])
-	}
-
 	joysticks := state.joysticks
 	if len(joysticks) == 0 {
 		joysticks = []string{t("no_joysticks_detected")}
 	}
-	joySel := widget.NewSelect(joysticks, func(v string) { state.selectedJoystick = v })
+	joySel := widget.NewSelect(joysticks, func(v string) {
+		state.selectedJoystick = v
+		if v == "" || v == t("no_joysticks_detected") {
+			return
+		}
+		go func(sel string) {
+			state.jsMutex.Lock()
+			if state.jsMonitoring {
+				state.jsMonitoring = false
+				if state.jsFile != nil {
+					state.jsFile.Close()
+					state.jsFile = nil
+				}
+			}
+			state.jsMutex.Unlock()
+			time.Sleep(80 * time.Millisecond)
+			go readJoystickEvents(state, sel, nil)
+			// também auto-lê configuração da placa associada
+			time.Sleep(300 * time.Millisecond)
+			if port := resolveSerialPort(state); port != "" {
+				if cfg, err := readButtonConfigFromSerial(port); err == nil {
+					state.config = cfg
+					setExport(state)
+					setStatus(state, t("config_read_board"))
+					win.SetContent(buildUI(state, win))
+				}
+			}
+		}(v)
+	})
 	if state.selectedJoystick != "" {
 		joySel.SetSelected(state.selectedJoystick)
 	} else if len(joysticks) > 0 {
 		joySel.SetSelected(joysticks[0])
+		state.selectedJoystick = joysticks[0]
+		// auto-monitoring no arranque
+		go func(sel string) {
+			time.Sleep(300 * time.Millisecond)
+			go readJoystickEvents(state, sel, nil)
+		}(joysticks[0])
 	}
 
-	// styled buttons
+	// styled buttons — rodam em goroutine para não travar a UI
 	readBtn := widget.NewButtonWithIcon(t("read_from_board"), theme.DownloadIcon(), func() {
-		if state.selectedPort == "" || state.selectedPort == t("no_ports_detected") {
-			setStatus(state, t("select_serial_port"))
-			return
-		}
-		cfg, err := readButtonConfigFromSerial(state.selectedPort)
-		if err != nil {
-			setStatus(state, t("error_reading_board")+" "+err.Error())
-			return
-		}
-		state.config = cfg
-		_ = persistLocalConfig(state.config)
-		setExport(state)
-		setStatus(state, t("config_read_board"))
-		win.SetContent(buildUI(state, win))
+		go func() {
+			port := resolveSerialPort(state)
+			if port == "" {
+				setStatus(state, t("select_serial_port"))
+				return
+			}
+			setStatus(state, t("monitoring")+" "+port+"...")
+			cfg, err := readButtonConfigFromSerial(port)
+			if err != nil {
+				setStatus(state, t("error_reading_board")+" "+err.Error())
+				return
+			}
+			state.config = cfg
+			setExport(state)
+			setStatus(state, t("config_read_board"))
+			win.SetContent(buildUI(state, win))
+		}()
 	})
 	applyBtn := widget.NewButtonWithIcon(t("apply_to_board"), theme.UploadIcon(), func() {
-		if state.selectedPort == "" || state.selectedPort == t("no_ports_detected") {
-			setStatus(state, t("select_serial_port"))
-			return
-		}
-		if err := applyButtonConfigToSerial(state.selectedPort, state.config); err != nil {
-			setStatus(state, t("error_applying_board")+" "+err.Error())
-			return
-		}
-		_ = persistLocalConfig(state.config)
-		setStatus(state, t("config_applied")+" "+state.selectedPort+".")
-		setExport(state)
+		go func() {
+			port := resolveSerialPort(state)
+			if port == "" {
+				setStatus(state, t("select_serial_port"))
+				return
+			}
+			setStatus(state, "Aplicando em "+port+"...")
+			if err := applyButtonConfigToSerial(port, state.config); err != nil {
+				setStatus(state, t("error_applying_board")+" "+err.Error())
+				return
+			}
+			setStatus(state, t("config_applied")+" "+port+".")
+			setExport(state)
+		}()
 	})
 	applyBtn.Importance = widget.HighImportance
 	resetBtn := widget.NewButtonWithIcon(t("reset"), theme.ViewRefreshIcon(), func() {
+		// reseta local e tenta resetar na placa também
+		go func() {
+			if port := resolveSerialPort(state); port != "" {
+				serialMu.Lock()
+				p, err := serial.Open(port, &serial.Mode{BaudRate: 115200})
+				if err == nil {
+					time.Sleep(1500 * time.Millisecond)
+					_, _ = p.Write([]byte("RESET\n"))
+					time.Sleep(200 * time.Millisecond)
+					_ = p.Close()
+				}
+				serialMu.Unlock()
+			}
+		}()
 		state.config = buildDefaultConfig()
-		_ = persistLocalConfig(state.config)
 		setExport(state)
 		setStatus(state, t("config_restored"))
 		win.SetContent(buildUI(state, win))
 	})
 
-	var monBtn *widget.Button
-	monBtn = widget.NewButtonWithIcon(t("monitor_joystick"), theme.MediaPlayIcon(), func() {
-		state.jsMutex.Lock()
-		isMon := state.jsMonitoring
-		state.jsMutex.Unlock()
-		if isMon {
-			state.jsMutex.Lock()
-			state.jsMonitoring = false
-			state.jsMutex.Unlock()
-			if state.jsFile != nil {
-				state.jsFile.Close()
-				state.jsFile = nil
-			}
-			setStatus(state, t("monitoring_stopped"))
-			monBtn.SetText(t("monitor_joystick"))
-			monBtn.SetIcon(theme.MediaPlayIcon())
-			return
-		}
-		if state.selectedJoystick == "" || state.selectedJoystick == t("no_joysticks_detected") {
-			setStatus(state, t("select_joystick"))
-			return
-		}
-		go readJoystickEvents(state, state.selectedJoystick, func() { win.SetContent(buildUI(state, win)) })
-		monBtn.SetText(t("stop_monitoring"))
-		monBtn.SetIcon(theme.MediaStopIcon())
-	})
-
-	// deck cards
-	bg1 := canvas.NewRectangle(colPanel)
-	bg1.StrokeColor = colPanelEdge
-	bg1.StrokeWidth = 1
-	bg1.CornerRadius = 10
-	serialTitle := canvas.NewText("PORTA SERIAL", colSteel)
-	serialTitle.TextSize = 9
-	serialTitle.TextStyle = fyne.TextStyle{Bold: true}
-	deck1Inner := container.NewVBox(
-		serialTitle,
-		portSel,
-		container.NewHBox(readBtn, applyBtn, resetBtn),
-	)
-	deck1 := container.NewStack(bg1, container.NewPadded(deck1Inner))
-
-	bg2 := canvas.NewRectangle(colPanel)
-	bg2.StrokeColor = colPanelEdge
-	bg2.StrokeWidth = 1
-	bg2.CornerRadius = 10
-	joyTitle := canvas.NewText("JOYSTICK", colSteel)
+	// deck único — só joystick (monitoramento automático), serial é auto-detectada do mesmo dispositivo
+	bg := canvas.NewRectangle(colPanel)
+	bg.StrokeColor = colPanelEdge
+	bg.StrokeWidth = 1
+	bg.CornerRadius = 10
+	joyTitle := canvas.NewText("DISPOSITIVO", colSteel)
 	joyTitle.TextSize = 9
 	joyTitle.TextStyle = fyne.TextStyle{Bold: true}
-	deck2Inner := container.NewVBox(
+	deckInner := container.NewVBox(
 		joyTitle,
 		joySel,
-		monBtn,
+		container.NewGridWithColumns(3, readBtn, applyBtn, resetBtn),
 	)
-	deck2 := container.NewStack(bg2, container.NewPadded(deck2Inner))
-
-	return container.NewGridWithColumns(2, deck1, deck2)
+	deck := container.NewStack(bg, container.NewPadded(deckInner))
+	return deck
 }
 
 func buildUI(state *uiState, win fyne.Window) fyne.CanvasObject {
@@ -1047,15 +1321,22 @@ func buildUI(state *uiState, win fyne.Window) fyne.CanvasObject {
 	deck := buildDeck(state, win)
 	header := buildHeader(state, win)
 
-	// main layout: header / deck / grid+legend / export
-	center := container.NewVBox(deck, container.NewHBox(container.NewPadded(grid), container.NewPadded(legend)))
+	// grid scroll with fixed min so it never collapses to 4px (screenshot bug)
+	gridScroll := container.NewVScroll(grid)
+	gridScroll.SetMinSize(fyne.NewSize(760, 640))
+
+	// legend fixed width on the right
+	legendWrap := container.NewPadded(legend)
+	legendScroll := container.NewVScroll(legendWrap)
+	legendScroll.SetMinSize(fyne.NewSize(280, 640))
+
+	middle := container.NewBorder(nil, nil, nil, legendScroll, gridScroll)
 
 	// outer bg
 	outerBg := canvas.NewRectangle(colBg)
-	content := container.NewVBox(header, center, exportCard)
+	content := container.NewVBox(header, deck, middle, exportCard)
 	padded := container.NewPadded(content)
-	scroll := container.NewVScroll(container.NewStack(outerBg, padded))
-	scroll.Direction = container.ScrollBoth
+	scroll := container.NewVScroll(padded)
 	return container.NewStack(outerBg, scroll)
 }
 
@@ -1076,5 +1357,26 @@ func main() {
 	w := a.NewWindow("ButtonBox — Button Mode Configuration")
 	w.Resize(fyne.NewSize(1180, 860))
 	w.SetContent(buildUI(state, w))
+	// auto-leitura da placa ao abrir (sem precisar clicar Read)
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		port := resolveSerialPort(state)
+		if port == "" {
+			log.Printf("auto-read: nenhuma porta ButtonBox")
+			return
+		}
+		log.Printf("auto-read: lendo de %s", port)
+		cfg, err := readButtonConfigFromSerial(port)
+		if err != nil {
+			log.Printf("auto-read falhou: %v", err)
+			setStatus(state, t("error_reading_board")+" "+err.Error())
+			return
+		}
+		state.config = cfg
+		setExport(state)
+		setStatus(state, t("config_read_board"))
+		w.SetContent(buildUI(state, w))
+		log.Printf("auto-read: ok")
+	}()
 	w.ShowAndRun()
 }

@@ -7,5 +7,6 @@ enum class ButtonMode : uint8_t {
     NORMAL = 0,   // saída = estado físico, 1:1 (comportamento padrão de um botão)
     ONE_SHOT,     // qualquer pressionar gera um único pulso curto, ignora quanto tempo fica segurado
     TOGGLE,       // primeira borda de subida liga, a próxima desliga (como um interruptor)
-    LONG_PRESS    // só fica "pressionado" no report se for segurado além de um tempo mínimo
+    LONG_PRESS,   // só fica "pressionado" no report se for segurado além de um tempo mínimo
+    TWO_SHOT,     // gera um pulso curto ao PRESSIONAR e outro ao SOLTAR (útil p/ marcha, seta, etc.)
 };

@@ -4,6 +4,7 @@ go 1.22
 
 require (
 	fyne.io/fyne/v2 v2.5.3
+	github.com/karalabe/hid v1.0.0
 	go.bug.st/serial v1.6.2
 )
 
