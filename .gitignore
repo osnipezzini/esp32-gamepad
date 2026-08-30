@@ -13,6 +13,7 @@ __pycache__/
 dist/
 build/
 target/
+.pio
 
 # Dependencies
 .venv/
