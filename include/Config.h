@@ -140,10 +140,22 @@ inline void saveButtonModesToStorage() {
     prefs.putUChar("magic", 0xB1);
     prefs.end();
 #else
+    // AVR/Arduino Leonardo: EEPROM já deve ter sido inicializada em BoardConfigAvr.cpp
+    // Se não estiver inicializada, tenta inicializar aqui como fallback
+    #if !defined(ESP32) && !defined(__SAM3X8E__)
+    static bool eepromInitialized = false;
+    if (!eepromInitialized) {
+        EEPROM.begin(BUTTON_COUNT + 1);
+        eepromInitialized = true;
+    }
+    #endif
     EEPROM.update(0, 0xB1);
     for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
         EEPROM.update(1 + i, encodeButtonMode(BUTTON_MODES[i]));
     }
+    #if !defined(ESP32) && !defined(__SAM3X8E__)
+    EEPROM.commit();
+    #endif
 #endif
 }
 
@@ -166,6 +178,16 @@ inline void loadButtonModesFromStorage() {
     }
     prefs.end();
 #else
+    // AVR/Arduino Leonardo: EEPROM já deve ter sido inicializada em BoardConfigAvr.cpp
+    // Se não estiver inicializada, tenta inicializar aqui como fallback
+    #if !defined(ESP32) && !defined(__SAM3X8E__)
+    static bool eepromInitialized = false;
+    if (!eepromInitialized) {
+        EEPROM.begin(BUTTON_COUNT + 1);
+        eepromInitialized = true;
+    }
+    #endif
+    
     if (EEPROM.read(0) != 0xB1) {
         saveButtonModesToStorage();
         return;
