@@ -10,26 +10,33 @@ __pycache__/
 *.so
 *.a
 *.out
+
+# Dependencies
+node_modules/
+venv/
+.venv/
+.env
+.env.local
+*.env.*
+
+# Build directories
 dist/
 build/
 target/
-.pio
+.gradle/
 
-# Dependencies
-.venv/
-venv/
-.env
-.env.local
-.env.*
-node_modules/
-.mypy_cache/
-.pytest_cache/
+# Python specific
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
 .coverage
 coverage/
 htmlcov/
-.gradle/
-julia-*/
-zig*/
+.mypy_cache/
+.pytest_cache/
 
 # Logs and temp files
 *.log
@@ -40,6 +47,8 @@ zig*/
 # Editors
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # System files
 .DS_Store
@@ -69,4 +78,3 @@ Thumbs.db
 *.tar.xz
 *.tar.zst
 ```
-tools/config-gui/buttonbox-config.json

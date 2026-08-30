@@ -32,14 +32,18 @@ static void printButtonStates() {
 }
 
 static void handleSerialConfig() {
-    if (Serial.available() <= 0) {
-        return;
-    }
-
     static String inputBuffer;
+    
+    // Processa todos os caracteres disponíveis
     while (Serial.available() > 0) {
         char ch = Serial.read();
-        if (ch == '\n' || ch == '\r') {
+        
+        // Ignora carriage return, processa apenas newline como terminador
+        if (ch == '\r') {
+            continue;
+        }
+        
+        if (ch == '\n') {
             if (inputBuffer.length() == 0) {
                 continue;
             }
@@ -47,6 +51,10 @@ static void handleSerialConfig() {
             String cmd = inputBuffer;
             inputBuffer = "";
             cmd.trim();
+
+            if (cmd.length() == 0) {
+                continue;
+            }
 
             if (cmd == "GET") {
                 printCurrentModes();
@@ -69,19 +77,33 @@ static void handleSerialConfig() {
             if (idx > 0) {
                 String key = cmd.substring(0, idx);
                 String value = cmd.substring(idx + 1);
+                value.trim();
                 int buttonIndex = key.toInt();
                 if (buttonIndex >= 0 && buttonIndex < BUTTON_COUNT) {
-                    setButtonMode(buttonIndex, parseButtonModeString(value.c_str()));
+                    ButtonMode newMode = parseButtonModeString(value.c_str());
+                    setButtonMode(buttonIndex, newMode);
                     saveButtonModesToStorage();
-                    Serial.print("OK");
+                    Serial.print("OK ");
                     Serial.print(buttonIndex);
                     Serial.print("=");
-                    Serial.println(buttonModeToString(getButtonMode(buttonIndex)));
+                    Serial.println(buttonModeToString(newMode));
+                } else {
+                    Serial.print("ERROR invalid index: ");
+                    Serial.println(key);
                 }
+            } else {
+                Serial.print("ERROR unknown command: ");
+                Serial.println(cmd);
             }
             continue;
         }
+        
         inputBuffer += ch;
+        
+        // Previne buffer overflow
+        if (inputBuffer.length() > 64) {
+            inputBuffer = "";
+        }
     }
 }
 

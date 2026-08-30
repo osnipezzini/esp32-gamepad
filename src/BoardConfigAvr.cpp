@@ -1,5 +1,6 @@
 #include "BoardConfig.h"
 #include <Arduino.h> // A0-A3
+#include <EEPROM.h>  // EEPROM para salvar configurações dos botões
 
 // ============================================================================
 //  Pinagem física do ATmega32U4 (Arduino Leonardo / SparkFun Pro Micro).
@@ -8,7 +9,19 @@
 //  [env:leonardo] e [env:promicro16] do platformio.ini.
 // ============================================================================
 
+// Inicializa EEPROM uma vez no startup para AVR
+static bool eepromInitialized = false;
+static void initEEPROM() {
+    if (!eepromInitialized) {
+        EEPROM.begin(17);  // 1 byte magic + 16 bytes modos
+        eepromInitialized = true;
+    }
+}
+
 const BoardConfig& getBoardConfig() {
+    // Garante que EEPROM está inicializada antes de qualquer uso
+    initEEPROM();
+    
     static const BoardConfig board = []() {
         BoardConfig cfg{};
 

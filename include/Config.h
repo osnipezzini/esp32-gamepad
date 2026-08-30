@@ -140,9 +140,10 @@ inline void saveButtonModesToStorage() {
     prefs.putUChar("magic", 0xB1);
     prefs.end();
 #else
-    EEPROM.update(0, 0xB1);
+    // AVR/Arduino: EEPROM não precisa de begin() ou commit()
+    EEPROM.write(0, 0xB1);
     for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
-        EEPROM.update(1 + i, encodeButtonMode(BUTTON_MODES[i]));
+        EEPROM.write(1 + i, encodeButtonMode(BUTTON_MODES[i]));
     }
 #endif
 }
@@ -166,6 +167,7 @@ inline void loadButtonModesFromStorage() {
     }
     prefs.end();
 #else
+    // AVR/Arduino: EEPROM não precisa de begin()
     if (EEPROM.read(0) != 0xB1) {
         saveButtonModesToStorage();
         return;
