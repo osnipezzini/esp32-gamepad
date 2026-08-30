@@ -3,10 +3,12 @@
 #include "OneShotButton.h"
 #include "ToggleButton.h"
 #include "LongPressButton.h"
+#include "TwoShotButton.h"
 
 IButton* ButtonManager::createButton(ButtonMode mode) {
     switch (mode) {
         case ButtonMode::ONE_SHOT:   return new OneShotButton();
+        case ButtonMode::TWO_SHOT:   return new TwoShotButton();
         case ButtonMode::TOGGLE:     return new ToggleButton();
         case ButtonMode::LONG_PRESS: return new LongPressButton();
         case ButtonMode::NORMAL:

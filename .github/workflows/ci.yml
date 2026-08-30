@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag/commit para build (vazio = branch atual)"
+        required: false
+        default: ""
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware:
+    name: Firmware (PlatformIO — 3 envs)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            .pio/libdeps
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Build all environments
+        run: pio run
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "### Firmware build outputs" >> $GITHUB_STEP_SUMMARY
+          ls -lh .pio/build/*/*.{bin,hex,elf} 2>/dev/null | tee -a $GITHUB_STEP_SUMMARY || echo "no binaries yet" >> $GITHUB_STEP_SUMMARY
+          pio run --target compiledb 2>&1 | head -20 || true
+
+  gui:
+    name: GUI — Config Tool (Go + Fyne)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/config-gui
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: tools/config-gui/go.sum
+
+      - name: Install Fyne system deps (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc libgl1-mesa-dev xorg-dev \
+            libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev \
+            libasound2-dev libxxf86vm-dev
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go mod tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum || (echo "::error::go.mod/go.sum not tidy — run 'go mod tidy'"; exit 1)
+
+      - name: Build GUI (Linux amd64)
+        run: |
+          CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o buttonbox-config-gui-linux-amd64 ./...
+
+      - name: Smoke test binary
+        run: |
+          ls -lh buttonbox-config-gui-linux-amd64
+          file buttonbox-config-gui-linux-amd64
+
+      - name: Upload GUI artifact (CI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-linux-ci
+          path: tools/config-gui/buttonbox-config-gui-linux-amd64
+          if-no-files-found: error
+          retention-days: 7
